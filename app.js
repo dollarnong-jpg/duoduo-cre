@@ -1,7 +1,7 @@
-import './backend.js?v=20261125-areasync1';
+import './backend.js?v=20261125-areasync2';
 await window.__duoduoBackendReady;
 
-const APP_VERSION = '1.28.70';
+const APP_VERSION = '1.28.71';
 const app = document.getElementById('app');
 const toastRegion = document.getElementById('toast-region');
 const modalRegion = document.getElementById('modal-region');
@@ -3891,6 +3891,7 @@ function renderFloorEditor(m, mode, preview) {
   return `<div class="form-section">
     <div class="section-title">楼层租金单价与面积</div>
     <div class="section-note">${mode === 'preliminary' ? `系统按项目计租方式汇总楼层收益${concessionEnabled ? '，并比较保底租金与联营扣点' : ''}。调整面积、租金、销售基数或扣点率后会自动重新测算。` : '一铺一价时，楼栋和楼层名称取铺位明细；建筑面积、实用面积仍可直接调整，系统会按该层现有铺位面积权重自动同步全部铺位，并立即重算计租面积、楼层均价和项目收益。铺位租金单价以导入或录入值为准，保持不变。'}</div>
+    <div class="section-note"><strong>面积基准规则：</strong>本表任一楼层面积每次录入或修改多少，就以这次录入值作为该楼层及其全部铺位的最新面积基准；不固定为某个示例值或默认值。</div>
     ${formulaPanel('商户租金公式', mode === 'preliminary' ? '商户计租面积 = IF(商户计租口径=建筑面积, 建筑面积, 实用面积)\n楼层满租月收益 = 商户计租面积 × 楼层租金单价\n项目租金单价 = 各楼层满租月租金收入合计 ÷ 项目商户计租面积合计' : '铺位满租月租金 = 铺位计租面积 × 铺位租金单价\n楼层满租月收益 = 该楼层全部铺位满租月租金合计\n楼层平均租金 = 楼层满租月收益 ÷ 楼层计租面积\n项目租金单价 = 全部铺位满租月租金合计 ÷ 项目商户计租面积合计', ['SUM', 'MAX', 'IF'], mode === 'preliminary' ? '初步测算以楼层租金单价为执行价。' : '一铺一价以铺位租金单价为执行价；楼层和项目租金单价均按面积加权计算。')}
     <div class="data-table-wrap floor-table-wrap">
       <table class="data-table floor-table"><thead><tr><th>楼栋</th><th>楼层</th><th>商户计租口径</th><th class="num">建筑面积（㎡）</th><th class="num">实用/租赁面积（㎡）</th><th class="num">${termLabel('得铺率')}</th><th class="num">商户计租面积（㎡）</th><th class="num">${mode === 'detailed' ? '楼层平均租金（元/㎡/月）' : '楼层租金单价（元/㎡/月）'}</th>${concessionEnabled ? `<th class="num">${termLabel('销售基数', '销售基数（元/㎡/月）')}</th><th class="num">${termLabel('扣点率')}</th>` : ''}<th class="num">满租月收益（元）</th><th></th></tr></thead><tbody>

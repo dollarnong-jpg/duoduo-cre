@@ -714,6 +714,9 @@ def audit_unified_rate_policy() -> None:
     assert "reconcileFloorRentOverrides(" not in app, "project open or calculation must not rewrite shop rents from floor averages"
     assert "已自动按楼层租金同步" not in app, "stale automatic floor-rent overwrite notice remains"
     require_text(app, "function syncFloorAreaToShops(path, targetValue, snapshot = [])", "floor area edits synchronize shop areas")
+    sync_area = function_segment(app, "syncFloorAreaToShops")
+    assert "12000" not in sync_area, "floor area synchronization must not hardcode an example value"
+    require_text(app, "本表任一楼层面积每次录入或修改多少，就以这次录入值作为该楼层及其全部铺位的最新面积基准", "floor area baseline rule is visible in the UI")
     require_text(app, "function effectiveShopRevenue(model, shop)", "shop revenue recalculates from the updated floor baseline")
     require_text(app, "data-floor-area-sync", "floor area remains editable in detailed mode")
     assert 'disabled title="建筑面积统一取铺位明细合计"' not in app, "detailed mode must not lock floor building area"
