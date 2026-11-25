@@ -149,7 +149,7 @@ def audit_defaults_and_units() -> None:
     require_text(backend, "const buildingConfigs = normalizedBuildingChargeConfigs(model, result);", "Excel HVAC export filters to actual buildings")
     require_text(app, "const centralConfigs = normalizeCentralAcBuildingConfigs(model);", "operating ledger filters stale HVAC buildings")
     require_text(app, "function synchronizeBuildingDataSources(model)", "single building and area source synchronizer")
-    require_text(app, "一铺一价时，楼栋、楼层和面积统一取铺位明细", "detailed mode locks building and area source")
+    require_text(app, "一铺一价时，楼栋和楼层名称取铺位明细；建筑面积、实用面积仍可直接调整", "detailed mode keeps floor areas editable and synchronized")
     require_text(engine_text, "active_shop_floor_keys = {building_floor_key(shop) for shop in shop_calc}", "engine ignores stale floors in detailed mode")
     require_text(backend, "_duoduoLocalProjectId", "local project migration marker")
     require_text(backend, "/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at&order=updated_at.desc&limit=1000", "admin all-project query")
@@ -713,6 +713,11 @@ def audit_unified_rate_policy() -> None:
     require_text(app, "铺位租金单价以导入或录入值为准", "shop rent uses imported or entered unit price")
     assert "reconcileFloorRentOverrides(" not in app, "project open or calculation must not rewrite shop rents from floor averages"
     assert "已自动按楼层租金同步" not in app, "stale automatic floor-rent overwrite notice remains"
+    require_text(app, "function syncFloorAreaToShops(path, targetValue, snapshot = [])", "floor area edits synchronize shop areas")
+    require_text(app, "function effectiveShopRevenue(model, shop)", "shop revenue recalculates from the updated floor baseline")
+    require_text(app, "data-floor-area-sync", "floor area remains editable in detailed mode")
+    assert 'disabled title="建筑面积统一取铺位明细合计"' not in app, "detailed mode must not lock floor building area"
+    assert 'disabled title="实用面积统一取铺位明细合计"' not in app, "detailed mode must not lock floor leasable area"
     require_text(app, "全项目统一使用本页录入的商业管理费单价核算", "project-wide commercial fee rate")
     require_text(app, "招商现金流已计入项目时间轴", "leasing cash reconciliation notice")
     require_text(app, "招商签约流入（万元）", "dedicated leasing cash column")
