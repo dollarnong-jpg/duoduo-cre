@@ -1,0 +1,4785 @@
+// Browser-side application backend for the public GitHub Pages edition.
+// Demo remains browser-local; formal accounts and projects use Supabase.
+const nativeFetch = window.fetch.bind(window);
+const APIJSON = 'application/json; charset=utf-8';
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+const USERS_KEY = 'duoduo_static_users_v1';
+const SESSION_PREFIX = 'local|';
+const CLOUD_CONFIG = window.DUODUO_CLOUD_CONFIG || {};
+const CLOUD_ENABLED = CLOUD_CONFIG.mode === 'cloud' && Boolean(CLOUD_CONFIG.url && CLOUD_CONFIG.anonKey);
+const CLOUD_BASE_URL = String(CLOUD_CONFIG.proxyUrl || CLOUD_CONFIG.url || '').replace(/\/$/, '');
+const CLOUD_SESSION_KEY = 'duoduo_cloud_session_v1';
+const DEMO_USER = { username: 'demo', displayName: '演示用户', passwordHash: 'sha256|cd6f2e06047d9e0e9a84ad4a9325dbec4fd1e5e6a17f0e94d5bf8892b7c9b80f' };
+
+function setBootText(text) {
+  const node = document.querySelector('.boot-text');
+  if (node) node.textContent = text;
+}
+
+function readJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJSON(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'Content-Type': APIJSON, 'Cache-Control': 'no-store' },
+  });
+}
+
+function fileResponse(blob, filename, contentType) {
+  return new Response(blob, {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+async function sha256(text) {
+  const bytes = new TextEncoder().encode(text);
+  if (crypto?.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return 'sha256|' + [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join('');
+  }
+  return 'plain|' + btoa(unescape(encodeURIComponent(text)));
+}
+
+async function ensureUsers() {
+  let users = readJSON(USERS_KEY, null);
+  if (!users || typeof users !== 'object') {
+    users = {};
+    users.demo = { ...DEMO_USER, passwordHash: await sha256('demo1234') };
+    writeJSON(USERS_KEY, users);
+  }
+  if (!users.demo) {
+    users.demo = { ...DEMO_USER, passwordHash: await sha256('demo1234') };
+    writeJSON(USERS_KEY, users);
+  }
+  return users;
+}
+
+async function ensureLocalAccount(username, password, displayName = '') {
+  const users = await ensureUsers();
+  if (users[username]) {
+    if (users[username].passwordHash !== await sha256(password)) {
+      throw Object.assign(new Error('本机已有同名账号，但密码不一致，请使用原密码或更换用户名'), { status: 409 });
+    }
+    return { user: users[username], created: false };
+  }
+  const user = {
+    username,
+    displayName: displayName || username,
+    passwordHash: await sha256(password),
+    role: 'user',
+    status: 'approved',
+    localMode: true,
+    createdAt: isoNow(),
+  };
+  users[username] = user;
+  writeJSON(USERS_KEY, users);
+  return { user, created: true };
+}
+
+function localUserResponse(username, user, extra = {}) {
+  return {
+    token: tokenFor(username),
+    user: {
+      username,
+      displayName: user.displayName || username,
+      role: normalizeUserRole(user.role),
+      status: 'approved',
+      localMode: true,
+      ...extra,
+    },
+    ...extra,
+  };
+}
+
+function normalizeUserRole(value) {
+  const role = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return ['super_admin', 'superadmin', 'admin', 'owner', 'administrator'].includes(role) ? 'super_admin' : 'user';
+}
+
+function isCloudConnectivityError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  return ['CLOUD_NETWORK', 'CLOUD_TIMEOUT', 'CLOUD_UNAVAILABLE'].includes(code) || Number(error?.status || 0) >= 500;
+}
+
+function tokenFor(username) {
+  return `${SESSION_PREFIX}${encodeURIComponent(username)}|${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+}
+
+function usernameFromToken(token) {
+  if (!token || !token.startsWith(SESSION_PREFIX)) return '';
+  const rest = token.slice(SESSION_PREFIX.length);
+  return decodeURIComponent(rest.split('|')[0] || '');
+}
+
+function authTokenFromRequest(init = {}) {
+  const headers = new Headers(init.headers || {});
+  const auth = headers.get('Authorization') || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  return localStorage.getItem('cr_token') || '';
+}
+
+async function currentUser(init) {
+  const token = authTokenFromRequest(init);
+  const localUsername = usernameFromToken(token);
+  // Legacy browser-local sessions are intentionally invalidated. Users must
+  // authenticate against the cloud account before any project can be accessed.
+  if (localUsername) return null;
+  if (CLOUD_ENABLED) return cloudCurrentUser(init);
+  return null;
+}
+
+function cloudSession() {
+  return readJSON(CLOUD_SESSION_KEY, null);
+}
+
+function storeCloudSession(payload, existing = null) {
+  const accessToken = payload.access_token || existing?.accessToken || '';
+  const refreshToken = payload.refresh_token || existing?.refreshToken || '';
+  const expiresIn = Number(payload.expires_in || 3600);
+  const session = {
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + Math.max(60, expiresIn - 30) * 1000,
+    userId: payload.user?.id || existing?.userId || '',
+    email: payload.user?.email || existing?.email || '',
+    username: existing?.username || '',
+    displayName: existing?.displayName || '',
+  };
+  writeJSON(CLOUD_SESSION_KEY, session);
+  localStorage.setItem('cr_token', accessToken);
+  return session;
+}
+
+function clearCloudSession() {
+  localStorage.removeItem(CLOUD_SESSION_KEY);
+  localStorage.removeItem('cr_token');
+  localStorage.removeItem('cr_user');
+}
+
+function cloudErrorMessage(payload, fallback = '云端服务请求失败') {
+  return payload?.msg || payload?.message || payload?.error_description || payload?.error?.message ||
+    (typeof payload?.error === 'string' ? payload.error : '') || payload?.details || payload?.hint || fallback;
+}
+
+function cloudXHRRequest(url, options, body, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(options.method || 'GET', url, true);
+    xhr.timeout = timeoutMs;
+    for (const [key, value] of options.headers.entries()) {
+      try { xhr.setRequestHeader(key, value); } catch {}
+    }
+    xhr.onload = () => resolve(new Response(xhr.responseText || '', {
+      status: xhr.status,
+      headers: { 'Content-Type': xhr.getResponseHeader('Content-Type') || 'application/json' },
+    }));
+    xhr.onerror = () => reject(new TypeError('Cloud XHR network failure'));
+    xhr.ontimeout = () => {
+      const error = new Error('Cloud XHR timeout');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    xhr.onabort = () => {
+      const error = new Error('Cloud XHR aborted');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    xhr.send(body);
+  });
+}
+
+async function cloudRequest(path, options = {}) {
+  const token = options.token || CLOUD_CONFIG.anonKey;
+  const headers = new Headers(options.headers || {});
+  headers.set('apikey', CLOUD_CONFIG.anonKey);
+  headers.set('Authorization', `Bearer ${token}`);
+  if (!headers.has('Accept')) headers.set('Accept', 'application/json');
+  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const attempts = Math.max(1, Math.min(6, Number(options.retries) || 4));
+  const timeoutMs = Math.max(5000, Number(options.timeoutMs) || 30000);
+  let lastError = null;
+  let lastTimedOut = false;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const url = `${CLOUD_BASE_URL}${path}`;
+      const body = options.body == null ? undefined : (typeof options.body === 'string' ? options.body : JSON.stringify(options.body));
+      const response = attempt % 2 === 0
+        ? await cloudXHRRequest(url, { method: options.method || 'GET', headers }, body, timeoutMs)
+        : await nativeFetch(url, {
+          method: options.method || 'GET',
+          headers,
+          body,
+          cache: 'no-store',
+          credentials: 'omit',
+          signal: controller.signal,
+        });
+      if ([502, 503, 504].includes(response.status) && attempt < attempts) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(8000, 800 * (2 ** (attempt - 1)))));
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      lastTimedOut = error?.name === 'AbortError';
+      if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, Math.min(8000, 800 * (2 ** (attempt - 1)))));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  const networkError = new Error(lastTimedOut
+    ? `连接云端服务超时，系统已通过标准通道和兼容通道自动重试${attempts}次。请直接再次点击“进入工作台”；如仍失败，请切换手机移动网络后重试。`
+    : `无法连接云端服务，系统已通过标准通道和兼容通道自动重试${attempts}次。请直接再次点击“进入工作台”；如仍失败，请切换手机移动网络后重试。`);
+  networkError.status = 503;
+  networkError.code = lastTimedOut ? 'CLOUD_TIMEOUT' : 'CLOUD_NETWORK';
+  networkError.cause = lastError;
+  throw networkError;
+}
+
+async function cloudJSON(path, options = {}) {
+  const response = await cloudRequest(path, options);
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try { payload = JSON.parse(text); } catch { payload = { message: text }; }
+  }
+  if (!response.ok) {
+    const error = new Error(cloudErrorMessage(payload, `云端服务错误（${response.status}）`));
+    error.status = response.status;
+    error.code = payload?.code || payload?.error_code || '';
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
+
+function normalizeUsername(value) {
+  return String(value ?? '')
+    .trim()
+    .replace(/^@+/, '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+async function usernameEmail(username) {
+  const digest = await sha256(normalizeUsername(username));
+  const hex = digest.replace(/^sha256\|/, '').slice(0, 32);
+  return `u_${hex}@duoduo.app`;
+}
+
+let cloudRefreshPromise = null;
+
+async function refreshCloudSession(force = false) {
+  const session = cloudSession();
+  if (!session) throw Object.assign(new Error('登录状态不存在，请重新登录'), { status: 401 });
+  if (!force && session.accessToken && Number(session.expiresAt || 0) > Date.now()) return session.accessToken;
+  if (!session.refreshToken) throw Object.assign(new Error('登录已过期，请重新登录'), { status: 401 });
+  if (!cloudRefreshPromise) {
+    cloudRefreshPromise = cloudJSON('/auth/v1/token?grant_type=refresh_token', {
+      method: 'POST',
+      body: { refresh_token: session.refreshToken },
+      token: CLOUD_CONFIG.anonKey,
+    }).then(payload => storeCloudSession(payload, session).accessToken).finally(() => {
+      cloudRefreshPromise = null;
+    });
+  }
+  return cloudRefreshPromise;
+}
+
+async function cloudAccessToken(forceRefresh = false) {
+  const session = cloudSession();
+  if (!session?.accessToken && !session?.refreshToken) {
+    throw Object.assign(new Error('请先登录'), { status: 401 });
+  }
+  if (!forceRefresh && session.accessToken && Number(session.expiresAt || 0) > Date.now()) {
+    return session.accessToken;
+  }
+  return refreshCloudSession(forceRefresh);
+}
+
+async function cloudProfileWithToken(token, userId) {
+  if (!userId) throw Object.assign(new Error('登录信息不完整，请重新登录'), { status: 401 });
+  const rows = await cloudJSON(`/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=id,username,display_name,status,role,created_at,approved_at,last_login_at`, { token });
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
+
+async function cloudCurrentUser(init = {}) {
+  let token = await cloudAccessToken();
+  let session = cloudSession();
+  let profile = null;
+  try {
+    profile = await cloudProfileWithToken(token, session?.userId);
+  } catch (error) {
+    if (error.status !== 401) throw error;
+    token = await cloudAccessToken(true);
+    session = cloudSession();
+    profile = await cloudProfileWithToken(token, session?.userId);
+  }
+  if (!profile) throw Object.assign(new Error('账号资料尚未建立，请联系管理员'), { status: 403 });
+  if (profile.status !== 'approved') {
+    const labels = { pending: '账号正在等待超级管理员审核', rejected: '账号审核未通过', disabled: '账号已被停用' };
+    throw Object.assign(new Error(labels[profile.status] || '账号当前不可用'), { status: 403, accountStatus: profile.status });
+  }
+  const normalized = {
+    id: profile.id,
+    username: profile.username,
+    displayName: profile.display_name || profile.username,
+    role: normalizeUserRole(profile.role),
+    status: profile.status,
+    isCloud: true,
+    createdAt: profile.created_at,
+    lastLoginAt: profile.last_login_at,
+  };
+  const current = cloudSession();
+  if (current) writeJSON(CLOUD_SESSION_KEY, { ...current, username: normalized.username, displayName: normalized.displayName, userId: normalized.id });
+  return normalized;
+}
+
+async function cloudSignOut() {
+  const session = cloudSession();
+  if (session?.accessToken) {
+    try {
+      await cloudRequest('/auth/v1/logout', { method: 'POST', token: session.accessToken });
+    } catch {}
+  }
+  clearCloudSession();
+}
+
+function cloudProject(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    model: row.model || {},
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function cloudRequireAdmin(init) {
+  const user = await cloudCurrentUser(init);
+  if (normalizeUserRole(user.role) !== 'super_admin') throw Object.assign(new Error('仅超级管理员可访问此功能'), { status: 403 });
+  return user;
+}
+
+async function cloudProjectSummary(project) {
+  try {
+    const result = await calculate(project.model, false);
+    return { ...project, summary: result.summary || {} };
+  } catch {
+    return { ...project, summary: {} };
+  }
+}
+
+function localProjectMigrationKey(userId) {
+  return `duoduo_local_cloud_migration_v1_${userId}`;
+}
+
+async function migrateLocalProjectsToCloud(user, token, cloudRows) {
+  const localRows = getProjects(user.username);
+  if (!localRows.length) return { rows: cloudRows, migrated: 0, failed: 0 };
+  const migrationKey = localProjectMigrationKey(user.id);
+  const migrated = readJSON(migrationKey, {});
+  let migratedCount = 0;
+  let failedCount = 0;
+  const localVersion = project => String(project?.updatedAt || project?.createdAt || '');
+  for (const localProject of localRows) {
+    if (!localProject?.id) continue;
+    const migrationRecord = migrated[localProject.id];
+    const mappedCloudId = typeof migrationRecord === 'string' ? migrationRecord : migrationRecord?.cloudId;
+    const existingRow = cloudRows.find(row =>
+      row?.id === mappedCloudId || row?.model?._duoduoLocalProjectId === localProject.id
+    );
+    if (existingRow) {
+      const localMs = Date.parse(localVersion(localProject));
+      const cloudMs = Date.parse(String(existingRow.updated_at || ''));
+      const localIsNewer = Number.isFinite(localMs) && (!Number.isFinite(cloudMs) || localMs > cloudMs + 1000);
+      if (!localIsNewer) {
+        migrated[localProject.id] = { cloudId: existingRow.id, localUpdatedAt: localVersion(localProject) };
+        writeJSON(migrationKey, migrated);
+        continue;
+      }
+      try {
+        const model = JSON.parse(JSON.stringify(localProject.model || {}));
+        model._duoduoLocalProjectId = localProject.id;
+        const updated = await cloudJSON(`/rest/v1/projects?id=eq.${encodeURIComponent(existingRow.id)}&select=id,user_id,name,model,created_at,updated_at`, {
+          method: 'PATCH',
+          token,
+          body: {
+            name: String(model.project?.name || existingRow.name || '本机项目').trim() || '本机项目',
+            model,
+            updated_at: new Date().toISOString(),
+          },
+          headers: { Prefer: 'return=representation' },
+        });
+        const row = Array.isArray(updated) ? updated[0] : null;
+        if (!row) throw new Error('云端未返回更新项目');
+        const rowIndex = cloudRows.findIndex(item => item.id === existingRow.id);
+        if (rowIndex >= 0) cloudRows[rowIndex] = row;
+        migrated[localProject.id] = { cloudId: row.id, localUpdatedAt: localVersion(localProject) };
+        writeJSON(migrationKey, migrated);
+        migratedCount += 1;
+      } catch (error) {
+        failedCount += 1;
+        console.warn('本机项目补传失败', localProject.id, error);
+      }
+      continue;
+    }
+    try {
+      const model = JSON.parse(JSON.stringify(localProject.model || {}));
+      model._duoduoLocalProjectId = localProject.id;
+      const created = await cloudJSON('/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at', {
+        method: 'POST',
+        token,
+        body: {
+          user_id: user.id,
+          name: String(model.project?.name || '本机项目').trim() || '本机项目',
+          model,
+          updated_at: new Date().toISOString(),
+        },
+        headers: { Prefer: 'return=representation' },
+      });
+      const row = Array.isArray(created) ? created[0] : null;
+      if (!row) throw new Error('云端未返回导入项目');
+      migrated[localProject.id] = { cloudId: row.id, localUpdatedAt: localVersion(localProject) };
+      writeJSON(migrationKey, migrated);
+      cloudRows.unshift(row);
+      migratedCount += 1;
+    } catch (error) {
+      failedCount += 1;
+      console.warn('本机项目迁移失败', localProject.id, error);
+    }
+  }
+  return { rows: cloudRows, migrated: migratedCount, failed: failedCount };
+}
+
+async function requestJSON(init) {
+  const raw = init?.body;
+  if (!raw) return {};
+  if (typeof raw === 'string') return JSON.parse(raw);
+  if (raw instanceof Blob) return JSON.parse(await raw.text());
+  if (raw instanceof ArrayBuffer) return JSON.parse(new TextDecoder().decode(raw));
+  return {};
+}
+
+function projectKey(username) {
+  return `duoduo_projects_v1_${username}`;
+}
+
+function getProjects(username) {
+  const rows = readJSON(projectKey(username), []);
+  return Array.isArray(rows) ? rows : [];
+}
+
+function saveProjects(username, rows) {
+  writeJSON(projectKey(username), rows);
+}
+
+function isoNow() {
+  return new Date().toISOString().slice(0, 19);
+}
+
+let pyodidePromise = null;
+
+function loadPyodideEngine() {
+  if (pyodidePromise) return pyodidePromise;
+  pyodidePromise = (async () => {
+    try {
+      setBootText('正在载入本地计算引擎…');
+      const indexURL = new URL('./pyodide/', import.meta.url).href;
+      // The service worker exposes the two large runtime files as one response
+      // assembled from small same-origin parts. Wait until it controls this page
+      // before Pyodide starts requesting its runtime.
+      await window.__duoduoSWReady;
+      const { loadPyodide } = await import(indexURL + 'pyodide.mjs');
+      const pyodide = await loadPyodide({ indexURL });
+      setBootText('正在初始化投资测算公式…');
+      const engineCode = await (await nativeFetch(new URL('./engine.py?v=20261125-loginfix3', import.meta.url))).text();
+      pyodide.FS.writeFile('/home/pyodide/engine.py', engineCode);
+      await pyodide.runPythonAsync(`
+import json
+import sys
+sys.path.insert(0, '/home/pyodide')
+import engine
+
+def duo_default_model(name):
+    return json.dumps(engine.default_model(name), ensure_ascii=False)
+
+def duo_normalize_model(model_json):
+    return json.dumps(engine.normalize_model(json.loads(model_json)), ensure_ascii=False)
+
+def duo_calculate(model_json, include_sensitivity=True):
+    return json.dumps(engine.calculate_model(json.loads(model_json), include_sensitivity=include_sensitivity), ensure_ascii=False)
+`);
+      window.__duoduoPyodide = pyodide;
+      setBootText('正在载入工作台…');
+      return pyodide;
+    } catch (error) {
+      console.error(error);
+      setBootText('载入失败，请刷新后重试');
+      throw error;
+    }
+  })().catch(error => {
+    pyodidePromise = null;
+    throw error;
+  });
+  return pyodidePromise;
+}
+
+let xlsxLibraryPromise = null;
+let pptxLibraryPromise = null;
+let jszipLibraryPromise = null;
+
+function loadVendorScript(src, globalName) {
+  if (window[globalName]) return Promise.resolve(window[globalName]);
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = () => window[globalName]
+      ? resolve(window[globalName])
+      : reject(new Error(`${globalName} 组件初始化失败`));
+    script.onerror = () => reject(new Error(`${globalName} 组件加载失败，请检查网络后重试`));
+    document.head.appendChild(script);
+  });
+}
+
+function ensureXlsxLibrary() {
+  if (!xlsxLibraryPromise) xlsxLibraryPromise = loadVendorScript(new URL('./vendor/xlsx.full.min.js', import.meta.url).href, 'XLSX');
+  return xlsxLibraryPromise;
+}
+
+function ensurePptxLibrary() {
+  if (!pptxLibraryPromise) pptxLibraryPromise = loadVendorScript(new URL('./vendor/pptxgen.bundle.js', import.meta.url).href, 'PptxGenJS');
+  return pptxLibraryPromise;
+}
+
+function ensureJszipLibrary() {
+  if (!jszipLibraryPromise) jszipLibraryPromise = loadVendorScript(new URL('./vendor/jszip.min.js', import.meta.url).href, 'JSZip');
+  return jszipLibraryPromise;
+}
+
+// The application shell starts immediately. Calculation and export libraries
+// are loaded only when a request actually needs them.
+window.__duoduoBackendReady = Promise.resolve();
+
+function pyCallJSON(expression, { model, includeSensitivity = true } = {}) {
+  const py = window.__duoduoPyodide;
+  if (!py) throw new Error('计算引擎尚未就绪');
+  if (model !== undefined) py.globals.set('__duo_model_json', JSON.stringify(model));
+  py.globals.set('__duo_include_sensitivity', Boolean(includeSensitivity));
+  return JSON.parse(py.runPython(expression));
+}
+
+async function calculate(model, includeSensitivity = true) {
+  return pyCallJSON('duo_calculate(__duo_model_json, __duo_include_sensitivity)', { model, includeSensitivity });
+}
+
+async function defaultModel(name) {
+  const py = window.__duoduoPyodide;
+  if (!py) throw new Error('计算引擎尚未就绪');
+  py.globals.set('__duo_name', String(name || '未命名商业项目'));
+  return JSON.parse(py.runPython('duo_default_model(__duo_name)'));
+}
+
+async function normalizeModel(model) {
+  return pyCallJSON('duo_normalize_model(__duo_model_json)', { model });
+}
+
+function demoModel() {
+  return {
+    version: 1,
+    calculationMode: 'preliminary',
+    project: {
+      name: '柳州沿江商业示例项目',
+      location: '广西壮族自治区柳州市沿江东堤路',
+      latitude: 24.341202,
+      longitude: 109.430294,
+      mapZoom: 15,
+      locationSource: 'address',
+      projectType: '购物中心',
+      developmentType: 'new_build',
+      ownerRentAreaBasis: 'building',
+      rentAreaBasis: 'leasable',
+      allowShopOverrides: false,
+      revenueModel: 'rent',
+      startYear: 2027,
+      constructionYears: 2,
+      constructionPeriodUnit: 'year',
+      constructionMonthsInput: 24,
+      operationYears: 20,
+      landArea: 7000,
+      gbaOverride: 0,
+      commonAreaFactor: 0.2,
+      landPrice: 3000,
+      otherPreOpening: 300,
+      preOpeningMarketing: 500,
+      contingencyRate: 0.05,
+    },
+    ownerRent: {
+      enabled: false,
+      leaseType: 'property',
+      landPricingMode: 'total',
+      landArea: 0,
+      landUnitRent: 0,
+      landMonthlyRent: 0,
+      landPaymentMonths: 12,
+      propertyPricingMode: 'total',
+      propertyArea: 0,
+      propertyUnitRent: 0,
+      propertyMonthlyRent: 0,
+      propertyAnnualRent: 0,
+      propertyPaymentMonths: 12,
+      growthMode: 'compound',
+      growthRate: 0.03,
+      annualIncrease: 0,
+      stepYears: 3,
+    },
+    floors: [
+      { building: '1号楼', name: 'B1', rentAreaBasis: 'inherit', buildingArea: 4000, leasableArea: 3000, avgRent: 50, salesPerSqmMonth: 0, concessionRate: 0 },
+      { building: '1号楼', name: '1F', rentAreaBasis: 'inherit', buildingArea: 4000, leasableArea: 3200, avgRent: 200, salesPerSqmMonth: 0, concessionRate: 0 },
+      { building: '1号楼', name: '2F', rentAreaBasis: 'inherit', buildingArea: 4000, leasableArea: 3200, avgRent: 130, salesPerSqmMonth: 0, concessionRate: 0 },
+      { building: '1号楼', name: '3F', rentAreaBasis: 'inherit', buildingArea: 4000, leasableArea: 3200, avgRent: 95, salesPerSqmMonth: 0, concessionRate: 0 },
+      { building: '1号楼', name: '4F', rentAreaBasis: 'inherit', buildingArea: 2000, leasableArea: 1600, avgRent: 65, salesPerSqmMonth: 0, concessionRate: 0 },
+    ],
+    shops: [
+      { id: 'B1-001', building: '1号楼', rentAreaBasis: 'inherit', buildingArea: 1800, leasableArea: 1450, floor: 'B1', category: '超市/主力店', status: '营业', rentOverride: 42, conditions: ['主入口'], note: '超市主力店' },
+      { id: '1F-001', buildingArea: 120, leasableArea: 92, floor: '1F', category: '餐饮', status: '营业', rentOverride: 195, conditions: ['转角铺', '临街'], note: '咖啡烘焙' },
+      { id: '1F-002', buildingArea: 88, leasableArea: 69, floor: '1F', category: '零售', status: '营业', rentOverride: 180, conditions: ['主入口'], note: '美妆集合店' },
+      { id: '1F-003', buildingArea: 160, leasableArea: 126, floor: '1F', category: '零售', status: '空置', rentOverride: 150, conditions: ['电梯口'], note: '运动零售' },
+      { id: '2F-001', buildingArea: 420, leasableArea: 336, floor: '2F', category: '餐饮', status: '营业', rentOverride: 110, conditions: ['中庭', '电梯口'], note: '社交餐饮' },
+      { id: '2F-002', buildingArea: 95, leasableArea: 76, floor: '2F', category: '服务', status: '营业', rentOverride: 125, conditions: ['通道口'], note: '丽人服务' },
+      { id: '3F-001', buildingArea: 280, leasableArea: 224, floor: '3F', category: '教培', status: '营业', rentOverride: 82, conditions: ['电梯口'], note: '儿童成长' },
+      { id: '4F-001', buildingArea: 650, leasableArea: 520, floor: '4F', category: '娱乐', status: '营业', rentOverride: 58, conditions: ['电梯口'], note: '娱乐体验' },
+    ],
+    market: {
+      radiusKm: 3,
+      comparables: [
+        { name: '城中商圈购物中心样本', address: '柳州市城中区', floor: '1F', category: '零售', leasableArea: 120, rent: 138, date: '2026-09', distanceKm: 1.8, note: '演示样本，请替换为实地调研数据' },
+        { name: '沿江街区餐饮样本', address: '柳州市城中区', floor: '1F', category: '餐饮', leasableArea: 95, rent: 165, date: '2026-09', distanceKm: 2.1, note: '演示样本，请替换为实地调研数据' },
+        { name: '社区商业超市样本', address: '柳州市柳北区', floor: 'B1', category: '超市/主力店', leasableArea: 1500, rent: 45, date: '2026-09', distanceKm: 3.2, note: '演示样本，请替换为实地调研数据' },
+        { name: '区域购物中心二层样本', address: '柳州市城中区', floor: '2F', category: '零售', leasableArea: 110, rent: 92, date: '2026-09', distanceKm: 2.4, note: '演示样本，请替换为实地调研数据' },
+      ],
+    },
+    costs: {
+      preconstructionRate: 260,
+      constructionRate: 3900,
+      municipalFeeRate: 0,
+      civilDefenseFeeRate: 0,
+      otherPublicFeeRate: 0,
+      fitoutRate: 1250,
+      equipmentRate: 680,
+      otherEngineeringRate: 180,
+      workingCapitalRate: 0.03,
+    },
+    revenues: { propertyFee: 20, otherIncomeRatio: 0.05, parkingSpaces: 480, parkingMonthly: 320 },
+    operations: {
+      rentGrowth: 0.03, occupancyY1: 0.72, occupancyY2: 0.86, stableOccupancy: 0.94, stableYear: 3,
+      rentFreeMonths: 3, collectionRate: 0.98, renewalCycle: 3, commissionMonths: 1, renewalCommissionMonths: 0.5,
+      depositMonths: 3, propertyOpsCost: 10, energyCost: 4.5, staffCostPerSqm: 11, adminCostPerSqm: 2,
+      marketingRate: 0.02, repairRate: 0.01, insuranceRate: 0.0015, capexRate: 0.02, otherOpexRate: 0.005,
+      salesGrowth: 0.03, rampY1: 0.8, rampY2: 0.9,
+    },
+    taxes: {
+      vatRent: 0.09, vatProperty: 0.06, vatOther: 0.06, vatConcession: 0.06, inputVatShare: 0.6, inputVatRate: 0.06,
+      cityTax: 0.07, educationSurcharge: 0.03, localEducationSurcharge: 0.02, propertyTaxMethod: 'rent',
+      propertyTaxRateRent: 0.12, propertyTaxRateValue: 0.012, propertyValueDeduction: 0.3, landUseTax: 0,
+      stampDuty: 0.001, localFundRate: 0, corporateTax: 0.25, deedTax: 0.03, exitTaxRate: 0,
+    },
+    finance: { debtRatio: 0.5, loanRate: 0.045, loanTerm: 15, graceYears: 1 },
+    valuation: { discountRate: 0.08, exitCapRate: 0.06, includeExit: true },
+  };
+}
+
+async function ensureDemoProject(username) {
+  if (username !== 'demo') return;
+  const rows = getProjects(username);
+  if (rows.length) return;
+  const model = await normalizeModel(demoModel());
+  const now = isoNow();
+  saveProjects(username, [{
+    id: crypto.randomUUID(),
+    model,
+    createdAt: now,
+    updatedAt: now,
+  }]);
+}
+
+function safeNumber(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  const text = String(value).trim().replace(/[,，]/g, '').replace(/[−–—]/g, '-');
+  const match = text.match(/[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/);
+  if (!match) return 0;
+  const n = Number(match[0]);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function optionalNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = safeNumber(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function roundArea(value) {
+  const number = safeNumber(value);
+  return Math.round((number + Number.EPSILON) * 100) / 100;
+}
+
+function normalizeHeader(value) {
+  return String(value ?? '').toLowerCase().replace(/[\s_\-—:：()（）[\]【】,，.。/\\]/g, '');
+}
+
+function matchesAlias(value, aliases) {
+  const normalized = normalizeHeader(value);
+  return Boolean(normalized) && aliases.some(alias => {
+    const a = normalizeHeader(alias);
+    return normalized === a || normalized.startsWith(a);
+  });
+}
+
+const SHOP_ALIASES = {
+  id: ['铺位号', '商铺号', '商铺编号', '铺位编号', '店铺号', '铺号', '编号', 'shopid', 'id'],
+  building: ['楼栋', '楼号', 'building', 'buildingname'],
+  buildingArea: ['建筑面积', '建筑面', 'grossarea'],
+  leasableArea: ['实际租赁面积', '租赁面积', '可租赁面积', '实用面积', '套内面积', '计租面积', 'leasablearea'],
+  floor: ['楼层', '所在楼层', 'floor'],
+  rentAreaBasis: ['商铺计租例外', '商户租金核算面积口径', '商户计租口径', '租金核算面积口径', '租金面积口径', '计租口径', '面积口径', 'rentareabasis'],
+  category: ['业态', '经营业态', 'category'],
+  status: ['状态', '经营状态', 'status'],
+  rentOverride: [
+    '租金单价覆盖', '租金单价', '月租金单价', '合同租金单价', '合同租金', '租金标准', '租金水平',
+    '保底租金单价', '保底租金', '平均租金', '合同月租金单价', '基准租金', '最终租金单价', '最终租金', '租金元㎡月',
+    '租金元月㎡', '月租金元月㎡', '租赁单价', '成交租金单价', '成交租金', '合同月租金', '租金', '月租金', 'rentoverride', 'rent'
+  ],
+  conditions: ['铺位条件', '位置条件', '条件', 'conditions'],
+  propertyFeeOverride: ['物业管理费单价覆盖', '物业管理费覆盖', '物业费单价覆盖', '物业管理费单价', '物业费单价'],
+  commercialManagementFeeOverride: ['商业管理费单价覆盖', '商业管理费覆盖', '商管费单价覆盖', '商业管理费单价', '商管费单价'],
+  centralAcFeeOverride: ['中央空调费单价覆盖', '中央空调使用费单价覆盖', '中央空调费覆盖', '中央空调单价', '中央空调费单价', '空调费单价'],
+  note: ['备注', '说明', 'note'],
+};
+
+function isPotentialRentHeader(value) {
+  const raw = String(value || '').trim();
+  const normalized = normalizeHeader(raw);
+  if (!normalized) return false;
+  if (/物业|商管|商业管理|管理费|空调|面积|面积口径|覆盖|递增|比例|起收|免收|日期|状态|备注|收益|收入/.test(normalized)) return false;
+  if (/租金|月租|租赁单价/.test(normalized)) return true;
+  return /(?:元|¥|rmb).*(?:㎡|平方米|平米)|(?:㎡|平方米|平米).*月/i.test(raw);
+}
+
+function normalizeRentAreaBasis(value, fallback = 'inherit') {
+  const text = String(value ?? '').trim();
+  if (/建筑/.test(text)) return 'building';
+  if (/实用|套内|租赁/.test(text)) return 'leasable';
+  return fallback;
+}
+
+const CN_DIGITS = { '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+
+function chineseNumber(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) return Number(text);
+  if (text === '十') return 10;
+  if (/^十[一二三四五六七八九]$/.test(text)) return 10 + CN_DIGITS[text[1]];
+  if (/^[一二三四五六七八九]十$/.test(text)) return CN_DIGITS[text[0]] * 10;
+  if (/^[一二三四五六七八九]十[一二三四五六七八九]$/.test(text)) return CN_DIGITS[text[0]] * 10 + CN_DIGITS[text[2]];
+  return CN_DIGITS[text] ?? null;
+}
+
+function normalizeBuildingName(value) {
+  let text = String(value ?? '').trim().replace(/（/g, '(').replace(/）/g, ')');
+  if (!text) return '1号楼';
+  if (/^\d+$/.test(text)) return `${Number(text)}号楼`;
+  if (/^[一二三四五六七八九十]+$/.test(text)) {
+    const n = chineseNumber(text);
+    return n == null ? text : `${n}号楼`;
+  }
+  text = text.replace(/^([一二三四五六七八九十]+)(号楼|栋|座)$/, (_, num, suffix) => {
+    const n = chineseNumber(num);
+    return `${n == null ? num : n}${suffix === '号楼' ? '号楼' : '号楼'}`;
+  });
+  text = text.replace(/^([A-Za-z0-9]+)(栋|座)$/, '$1号楼');
+  return text;
+}
+
+function normalizeFloorName(value) {
+  const text = String(value ?? '').trim().replace(/\s+/g, '').replace(/Ｆ/gi, 'F');
+  if (!text) return '';
+  const upper = text.toUpperCase();
+  if (/^B\d+$/.test(upper)) return upper;
+  const basement = upper.match(/^(?:负|地下|-)([0-9一二三四五六七八九十]+)(?:层|楼)?$/);
+  if (basement) {
+    const n = chineseNumber(basement[1]);
+    return n == null ? text : `B${n}`;
+  }
+  if (/^(?:首层|一层)$/.test(text)) return '1F';
+  const floor = text.match(/^([0-9一二三四五六七八九十]+)(?:层|楼|F)$/i);
+  if (floor) {
+    const n = chineseNumber(floor[1]);
+    return n == null ? text : `${n}F`;
+  }
+  const prefixed = upper.match(/^(?:F|L)(\d+)$/);
+  if (prefixed) return `${Number(prefixed[1])}F`;
+  return upper.replace(/^(\d+)$/, '$1F');
+}
+
+function splitBuildingFloor(buildingValue, floorValue) {
+  let building = String(buildingValue ?? '').trim();
+  let floor = String(floorValue ?? '').trim();
+  const combined = `${building} ${floor}`.trim();
+  const match = combined.match(/([A-Za-z0-9一二三四五六七八九十]+(?:号楼|栋|座|楼))[\s\-—_]*(负[0-9一二三四五六七八九十]+层|地下[0-9一二三四五六七八九十]+层|B\d+|(?:\d+|[一二三四五六七八九十]+)(?:层|楼|F)|F\d+|L\d+|首层|M层)/i);
+  if (match) {
+    building = match[1];
+    floor = match[2];
+  }
+  return { building: normalizeBuildingName(building), floor: normalizeFloorName(floor) };
+}
+
+const MARKET_ALIASES = {
+  name: ['样本名称', '项目名称', '竞品名称', '商场名称', 'name'],
+  address: ['地址', '项目地址', '竞品地址', 'address'],
+  floor: ['楼层', '所在楼层', 'floor'],
+  category: ['业态', '经营业态', 'category'],
+  leasableArea: ['可租赁面积', '租赁面积', '建筑面积', '面积', 'leasablearea'],
+  rent: ['月租金单价', '租金单价', '租金元㎡月', 'rent'],
+  date: ['数据日期', '调研日期', 'date'],
+  distanceKm: ['距项目km', '距离km', '距项目距离', 'distancekm', 'distance'],
+  note: ['备注', '说明', 'note'],
+};
+
+function findHeaderRow(rows, aliases, requiredKeys) {
+  for (let i = 0; i < Math.min(rows.length, 35); i++) {
+    const row = rows[i] || [];
+    const found = requiredKeys.every(key => row.some(cell => matchesAlias(cell, aliases[key])));
+    if (found) return i;
+  }
+  return -1;
+}
+
+function headerIndexes(row, aliases) {
+  const result = {};
+  for (const [key, values] of Object.entries(aliases)) {
+    const exactAliases = new Set(values.map(value => normalizeHeader(value)));
+    let idx = row.findIndex(cell => exactAliases.has(normalizeHeader(cell)));
+    if (idx < 0) idx = row.findIndex(cell => matchesAlias(cell, values));
+    if (idx >= 0) result[key] = idx;
+  }
+  return result;
+}
+
+function rowValue(row, indexes, key) {
+  const idx = indexes[key];
+  return idx === undefined || idx >= row.length ? '' : row[idx];
+}
+
+function splitConditions(value) {
+  if (Array.isArray(value)) return value.map(x => String(x).trim()).filter(Boolean);
+  return String(value || '').split(/[、,，/|]+/).map(x => x.trim()).filter(Boolean);
+}
+
+function parseYesNo(value, fallback = null) {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return fallback;
+  if (/^(是|收|收取|启用|有|yes|y|true|1)$/i.test(text)) return true;
+  if (/^(否|不收|不收取|停用|无|no|n|false|0)$/i.test(text)) return false;
+  if (/不收|免收|不启用|否/.test(text)) return false;
+  if (/收取|启用|是/.test(text)) return true;
+  return fallback;
+}
+
+function parseCentralAcBuildingConfigs(workbook) {
+  const sheetName = workbook.SheetNames.find(name => name.includes('楼栋收费'));
+  if (!sheetName) return [];
+  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false, defval: '' });
+  const headerIdx = rows.findIndex(row => row.some(cell => /^楼栋$|楼号|building/i.test(String(cell || ''))) && row.some(cell => /空调/.test(String(cell || ''))));
+  if (headerIdx < 0) return [];
+  const buildingAliases = ['楼栋', '楼号', 'building'];
+  const enabledAliases = ['是否收取中央空调费', '是否收取空调费', '中央空调收费', '是否收费'];
+  const feeAliases = ['中央空调费单价', '中央空调使用费单价', '空调费单价', 'centralacfee'];
+  const indexes = headerIndexes(rows[headerIdx], { building: buildingAliases, enabled: enabledAliases, fee: feeAliases });
+  const configs = [];
+  for (const row of rows.slice(headerIdx + 1)) {
+    const building = normalizeBuildingName(rowValue(row, indexes, 'building'));
+    const rawBuilding = String(rowValue(row, indexes, 'building') || '').trim();
+    if (!rawBuilding) continue;
+    const fee = Math.max(0, optionalNumber(rowValue(row, indexes, 'fee')) || 0);
+    const enabled = parseYesNo(rowValue(row, indexes, 'enabled'), fee > 0);
+    configs.push({ building, enabled: Boolean(enabled && fee > 0), fee });
+  }
+  return configs;
+}
+
+function parseRentOverride(value, header, fallbackArea = 0) {
+  const price = optionalNumber(value);
+  if (price === null) return null;
+  let normalizedPrice = price;
+  const normalized = normalizeHeader(header);
+  const areaUnit = /㎡|平方米|平米|平方/.test(String(header || ''));
+  if (areaUnit && /万元/.test(String(header || ''))) normalizedPrice *= 10000;
+  if (areaUnit && /天/.test(normalized)) normalizedPrice *= 30.4;
+  if (areaUnit && /年/.test(normalized)) normalizedPrice /= 12;
+  const isRentTotal = /总额|合计/.test(normalized) || (!areaUnit && /月租金/.test(normalized) && !/单价|标准|水平/.test(normalized));
+  if (isRentTotal && fallbackArea > 0) normalizedPrice /= fallbackArea;
+  return Number.isFinite(normalizedPrice) ? Math.round(normalizedPrice * 10000) / 10000 : null;
+}
+
+function sheetRows(workbook, preferredNames = []) {
+  const sheets = workbook.SheetNames.map(name => ({ name, sheet: workbook.Sheets[name] }));
+  sheets.sort((a, b) => {
+    const ai = preferredNames.some(key => a.name.includes(key)) ? 0 : 1;
+    const bi = preferredNames.some(key => b.name.includes(key)) ? 0 : 1;
+    return ai - bi;
+  });
+  for (const { name, sheet } of sheets) {
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+    if (rows.length) return { name, rows };
+  }
+  return { name: '', rows: [] };
+}
+
+function findShopSheet(workbook) {
+  const candidates = workbook.SheetNames.map((name, order) => {
+    const sheet = workbook.Sheets[name];
+    const rows = sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' }) : [];
+    const headerIdx = findHeaderRow(rows, SHOP_ALIASES, ['id', 'buildingArea', 'leasableArea']);
+    return { name, rows, headerIdx, order };
+  }).filter(item => item.headerIdx >= 0);
+  candidates.sort((a, b) => {
+    const aPreferred = ['商铺', '铺位', '一铺一价', '明细', '价格'].some(key => a.name.includes(key)) ? 0 : 1;
+    const bPreferred = ['商铺', '铺位', '一铺一价', '明细', '价格'].some(key => b.name.includes(key)) ? 0 : 1;
+    return aPreferred - bPreferred || a.headerIdx - b.headerIdx || a.order - b.order;
+  });
+  return candidates[0] || null;
+}
+
+function readWorkbook(base64, filename) {
+  const clean = String(base64 || '').split(',').pop();
+  const binary = atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  if (filename.toLowerCase().endsWith('.csv')) {
+    let text = new TextDecoder('utf-8', { fatal: false }).decode(bytes).replace(/^\uFEFF/, '');
+    if (text.includes('�')) {
+      try { text = new TextDecoder('gb18030').decode(bytes); } catch {}
+    }
+    return XLSX.read(text, { type: 'string', raw: false });
+  }
+  return XLSX.read(bytes, { type: 'array', cellDates: true, raw: false });
+}
+
+function parseShopWorkbook(base64, filename) {
+  if (filename.toLowerCase().endsWith('.xls')) throw new Error('暂不支持旧版.xls，请在 Excel 中另存为.xlsx');
+  if (!/\.(xlsx|xlsm|csv)$/i.test(filename)) throw new Error('仅支持.xlsx、.xlsm、.csv文件');
+  const wb = readWorkbook(base64, filename);
+  const matchedSheet = findShopSheet(wb);
+  if (!matchedSheet) throw new Error(`工作簿中未找到“铺位号、建筑面积、实际租赁面积”列。已检查工作表：${wb.SheetNames.join('、')}`);
+  const { name, rows, headerIdx } = matchedSheet;
+  const indexes = headerIndexes(rows[headerIdx], SHOP_ALIASES);
+  if (indexes.rentOverride === undefined) {
+    const fallbackRentIndex = (rows[headerIdx] || []).findIndex(cell => isPotentialRentHeader(cell));
+    if (fallbackRentIndex >= 0) indexes.rentOverride = fallbackRentIndex;
+  }
+  const rentHeader = rowValue(rows[headerIdx], indexes, 'rentOverride');
+  const shops = [];
+  for (const row of rows.slice(headerIdx + 1)) {
+    const id = String(rowValue(row, indexes, 'id') || '').trim();
+    const buildingArea = roundArea(rowValue(row, indexes, 'buildingArea'));
+    const leasableArea = roundArea(rowValue(row, indexes, 'leasableArea'));
+    const rowText = (Array.isArray(row) ? row : []).map(value => String(value || '')).join(' ');
+    if (/合计|总计|小计/.test(id) || (!id && /合计|总计|小计/.test(rowText))) continue;
+    if (!id && buildingArea <= 0 && leasableArea <= 0) continue;
+    const normalizedLocation = splitBuildingFloor(
+      rowValue(row, indexes, 'building'),
+      rowValue(row, indexes, 'floor'),
+    );
+    const rentAreaBasis = normalizeRentAreaBasis(rowValue(row, indexes, 'rentAreaBasis'), 'inherit');
+    const fallbackRentArea = rentAreaBasis === 'building' ? buildingArea : (leasableArea || buildingArea);
+    shops.push({
+      id,
+      building: normalizedLocation.building,
+      buildingArea,
+      leasableArea,
+      floor: normalizedLocation.floor,
+      rentAreaBasis,
+      rentAreaBasisOverride: rentAreaBasis !== 'inherit',
+      category: String(rowValue(row, indexes, 'category') || '零售').trim(),
+      status: String(rowValue(row, indexes, 'status') || '营业').trim(),
+      rentOverride: parseRentOverride(rowValue(row, indexes, 'rentOverride'), rentHeader, fallbackRentArea),
+      propertyFeeOverride: optionalNumber(rowValue(row, indexes, 'propertyFeeOverride')),
+      commercialManagementFeeOverride: optionalNumber(rowValue(row, indexes, 'commercialManagementFeeOverride')),
+      centralAcFeeOverride: optionalNumber(rowValue(row, indexes, 'centralAcFeeOverride')),
+      conditions: splitConditions(rowValue(row, indexes, 'conditions')),
+      note: String(rowValue(row, indexes, 'note') || '').trim(),
+    });
+  }
+  const projectHints = { project: {}, revenues: {}, centralAcBuildings: parseCentralAcBuildingConfigs(wb) };
+  const projectSheetName = wb.SheetNames.find(name => name === '项目信息') || wb.SheetNames.find(name => name.includes('项目'));
+  if (projectSheetName) {
+    const projectRows = XLSX.utils.sheet_to_json(wb.Sheets[projectSheetName], { header: 1, raw: false, defval: '' });
+    const numericProjectFields = new Set(['startYear', 'constructionYears', 'constructionMonthsInput', 'gbaOverride', 'landArea', 'landPrice', 'otherPreOpening', 'preOpeningMarketing']);
+    for (const row of projectRows) {
+      const rawLabel = String(row?.[0] || '').trim();
+      const value = row?.[1];
+      if (!rawLabel || value === null || value === undefined || value === '') continue;
+      if (/项目名称/.test(rawLabel)) projectHints.project.name = String(value).trim();
+      else if (/项目位置|项目地址/.test(rawLabel)) projectHints.project.location = String(value).trim();
+      else if (/商业项目形态|项目形态/.test(rawLabel)) projectHints.project.projectType = String(value).trim();
+      else if (/业主租金支付面积口径|业主计租口径/.test(rawLabel)) projectHints.project.ownerRentAreaBasis = normalizeRentAreaBasis(value, 'building');
+      else if (/商户租金核算面积口径|商户租金默认口径|商户计租口径|租金核算面积口径|租金面积口径|计租口径/.test(rawLabel)) projectHints.project.rentAreaBasis = normalizeRentAreaBasis(value, 'leasable');
+      else if (/项目开发状态/.test(rawLabel)) {
+        const text = String(value);
+        projectHints.project.developmentType = /旧改|存量|改造/.test(text) ? 'renovation' : /运营中/.test(text) ? 'operating' : /轻资产/.test(text) ? 'light_asset' : 'new_build';
+      }
+      else if (/项目立项.*进场日期|立项日期/.test(rawLabel)) projectHints.project.investmentDate = String(value).trim();
+      else if (/建设开工日期|开工日期/.test(rawLabel)) projectHints.project.constructionStartDate = String(value).trim();
+      else if (/计划竣工日期|竣工日期/.test(rawLabel)) projectHints.project.constructionEndDate = String(value).trim();
+      else if (/项目接管.*进场日期|接管日期/.test(rawLabel)) projectHints.project.handoverDate = String(value).trim();
+      else if (/招商启动日期/.test(rawLabel)) projectHints.project.leasingStartDate = String(value).trim();
+      else if (/计划开业日期|开业日期/.test(rawLabel)) projectHints.project.openingDate = String(value).trim();
+      else if (/招商运营年限/.test(rawLabel)) projectHints.project.operationYears = safeNumber(value);
+      else if (/起始年份/.test(rawLabel)) projectHints.project.startYear = safeNumber(value);
+      else if (/建设期.*核算方式/.test(rawLabel)) projectHints.project.constructionPeriodUnit = /月/.test(String(value)) ? 'month' : 'year';
+      else if (/建设期.*月|建设期（月）/.test(rawLabel)) { projectHints.project.constructionPeriodUnit = 'month'; projectHints.project.constructionMonthsInput = safeNumber(value); }
+      else if (/建设期/.test(rawLabel)) projectHints.project.constructionYears = safeNumber(value);
+      else if (/总建筑面积/.test(rawLabel)) projectHints.project.gbaOverride = roundArea(value);
+      else if (/占地面积/.test(rawLabel)) projectHints.project.landArea = roundArea(value);
+      else if (/土地价款/.test(rawLabel)) projectHints.project.landPrice = safeNumber(value);
+      else if (/其他前期费用/.test(rawLabel)) projectHints.project.otherPreOpening = safeNumber(value);
+      else if (/筹备期营销费用/.test(rawLabel)) projectHints.project.preOpeningMarketing = safeNumber(value);
+      else if (/物业管理费单价|物业费单价/.test(rawLabel)) projectHints.revenues.propertyFee = Math.max(0, safeNumber(value));
+      else if (/商业管理费单价|商管费单价/.test(rawLabel)) projectHints.revenues.commercialManagementFee = Math.max(0, safeNumber(value));
+      else if (/默认中央空调.*单价|中央空调.*单价|空调费单价/.test(rawLabel)) projectHints.revenues.centralAcFee = Math.max(0, safeNumber(value));
+    }
+    for (const key of Object.keys(projectHints.project)) {
+      if (numericProjectFields.has(key) && !Number.isFinite(Number(projectHints.project[key]))) delete projectHints.project[key];
+    }
+  }
+  const warnings = shopWarnings(shops);
+  const hasLeasableArea = shops.some(shop => Number(shop.leasableArea || 0) > 0);
+  if (shops.length && projectHints.project.rentAreaBasis === 'leasable' && !hasLeasableArea) {
+    projectHints.project.rentAreaBasis = 'building';
+    warnings.unshift('导入表未填写实用/套内面积，已自动按建筑面积计租；如需按实用面积计租，请补充该列后重新导入。');
+  }
+  const rentRecognizedCount = shops.filter(shop => shop.rentOverride !== null && shop.rentOverride > 0).length;
+  const rentMissingCount = Math.max(0, shops.length - rentRecognizedCount);
+  const propertyFeeOverrideCount = shops.filter(shop => shop.propertyFeeOverride !== null).length;
+  const commercialManagementFeeOverrideCount = shops.filter(shop => shop.commercialManagementFeeOverride !== null).length;
+  const centralAcFeeOverrideCount = shops.filter(shop => shop.centralAcFeeOverride !== null).length;
+  if (indexes.rentOverride === undefined) {
+    warnings.unshift('未识别到租金单价列。请使用“租金单价”“月租金单价”“租金标准”或“合同租金单价”等表头。');
+  } else if (rentRecognizedCount === 0) {
+    warnings.unshift(`已识别租金列“${String(rentHeader).trim()}”，但所有铺位的租金值均为空或不是有效数字。`);
+  } else {
+    warnings.unshift(`已识别 ${rentRecognizedCount} 个铺位的租金单价${rentMissingCount ? `；另有 ${rentMissingCount} 个铺位未填写，将按楼层和业态自动定价` : ''}。`);
+  }
+  return {
+    shops,
+    warnings,
+    sheet: name,
+    rowsRead: Math.max(0, rows.length - headerIdx - 1),
+    projectHints,
+    rentColumn: indexes.rentOverride === undefined ? '' : String(rentHeader).trim(),
+    rentRecognizedCount,
+    rentMissingCount,
+    propertyFeeOverrideCount,
+    commercialManagementFeeOverrideCount,
+    centralAcFeeOverrideCount,
+  };
+}
+
+function shopWarnings(shops) {
+  const warnings = [];
+  const counts = {};
+  for (const shop of shops) if (shop.id) {
+    const key = `${shop.building || '1号楼'}||${shop.id}`;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  const duplicates = Object.entries(counts).filter(([, n]) => n > 1).map(([key]) => key.replace('||', ' / '));
+  if (duplicates.length) warnings.push(`发现重复铺位号：${duplicates.slice(0, 8).join(', ')}`);
+  const missingArea = shops.filter(s => safeNumber(s.buildingArea) <= 0).length;
+  if (missingArea) warnings.push(`${missingArea}个铺位缺少建筑面积`);
+  const missingLease = shops.filter(s => safeNumber(s.leasableArea) <= 0).length;
+  if (missingLease) warnings.push(`${missingLease}个铺位缺少实际租赁面积`);
+  const missingFloor = shops.filter(shop => !shop.floor).length;
+  if (missingFloor) warnings.push(`${missingFloor}个铺位缺少可识别的楼层，请填写1F、2F、B1或“一楼”等格式`);
+  const invalidArea = shops.filter(s => safeNumber(s.leasableArea) > safeNumber(s.buildingArea) && safeNumber(s.buildingArea) > 0).length;
+  if (invalidArea) warnings.push(`${invalidArea}个铺位实际租赁面积大于建筑面积`);
+  return warnings;
+}
+
+function parseMarketWorkbook(base64, filename) {
+  if (!/\.(xlsx|xlsm|csv)$/i.test(filename)) throw new Error('仅支持.xlsx、.xlsm、.csv');
+  const wb = readWorkbook(base64, filename);
+  const { rows } = sheetRows(wb, ['竞品', '租金', '市场']);
+  const headerIdx = findHeaderRow(rows, MARKET_ALIASES, ['name', 'rent']);
+  if (headerIdx < 0) throw new Error('未找到竞品名称和月租金单价列');
+  const indexes = headerIndexes(rows[headerIdx], MARKET_ALIASES);
+  const comparables = [];
+  for (const row of rows.slice(headerIdx + 1)) {
+    const name = String(rowValue(row, indexes, 'name') || '').trim();
+    const address = String(rowValue(row, indexes, 'address') || '').trim();
+    const rent = safeNumber(rowValue(row, indexes, 'rent'));
+    if (!name && !address && rent <= 0) continue;
+    comparables.push({
+      name: name || address || '未命名样本',
+      address,
+      floor: String(rowValue(row, indexes, 'floor') || '').trim(),
+      category: String(rowValue(row, indexes, 'category') || '零售').trim(),
+      leasableArea: roundArea(rowValue(row, indexes, 'leasableArea')),
+      rent,
+      date: String(rowValue(row, indexes, 'date') || '').trim(),
+      distanceKm: optionalNumber(rowValue(row, indexes, 'distanceKm')),
+      note: String(rowValue(row, indexes, 'note') || '').trim(),
+    });
+  }
+  const warnings = [];
+  if (!comparables.length) warnings.push('未读取到有效竞品样本');
+  const noRent = comparables.filter(x => safeNumber(x.rent) <= 0).length;
+  if (noRent) warnings.push(`${noRent}条样本缺少月租金单价`);
+  const noArea = comparables.filter(x => safeNumber(x.leasableArea) <= 0).length;
+  if (noArea) warnings.push(`${noArea}条样本缺少可租赁面积，租金均值将按样本简单平均`);
+  return { comparables, warnings };
+}
+
+const EXCEL_FONT = 'Arial';
+
+function excelXmlEscape(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+function excelXmlAttr(source, name) {
+  const pattern = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}="([^"]*)"`);
+  const match = String(source || '').match(pattern);
+  return match ? match[1].replaceAll('&amp;', '&').replaceAll('&quot;', '"').replaceAll('&apos;', "'") : '';
+}
+
+function excelPageSetupXml(setup) {
+  if (!setup) return '';
+  const orientation = setup.orientation === 'portrait' ? 'portrait' : 'landscape';
+  const fitToWidth = Math.max(1, Number(setup.fitToWidth || 1));
+  const fitToHeight = Math.max(0, Number(setup.fitToHeight || 0));
+  const paperSize = Math.max(1, Number(setup.paperSize || 9));
+  return `<pageSetup paperSize="${paperSize}" orientation="${orientation}" fitToWidth="${fitToWidth}" fitToHeight="${fitToHeight}"/>`;
+}
+
+function excelFreezePaneXml(freeze) {
+  if (!freeze) return '';
+  const xSplit = Math.max(0, Number(freeze.xSplit || 0));
+  const ySplit = Math.max(0, Number(freeze.ySplit || 0));
+  if (!xSplit && !ySplit) return '';
+  const topLeftCell = XLSX.utils.encode_cell({ r: ySplit, c: xSplit });
+  const activePane = xSplit && ySplit ? 'bottomRight' : ySplit ? 'bottomLeft' : 'topRight';
+  return `<pane${xSplit ? ` xSplit="${xSplit}"` : ''}${ySplit ? ` ySplit="${ySplit}"` : ''} topLeftCell="${topLeftCell}" activePane="${activePane}" state="frozen"/>`;
+}
+
+function excelSheetViewXml(sheetXml, ws) {
+  const view = ws?.['!sheetViews']?.[0] || {};
+  const showGridLines = view.showGridLines === false ? '0' : '1';
+  const zoomScale = Math.max(60, Math.min(100, Number(view.zoomScale || 100)));
+  const pane = excelFreezePaneXml(ws?.['!excelFreeze']);
+  const match = sheetXml.match(/<sheetView\b([^>]*?)(?:\/>|>([\s\S]*?)<\/sheetView>)/);
+  if (!match) {
+    return sheetXml.replace('<sheetViews>', `<sheetViews><sheetView showGridLines="${showGridLines}" zoomScale="${zoomScale}" zoomScaleNormal="${zoomScale}" workbookViewId="0">${pane}</sheetView>`);
+  }
+  const attrs = match[1]
+    .replace(/\s+showGridLines="[^"]*"/g, '')
+    .replace(/\s+zoomScale="[^"]*"/g, '')
+    .replace(/\s+zoomScaleNormal="[^"]*"/g, '')
+    .replace(/\s+workbookViewId="[^"]*"/g, '');
+  const existing = match[2] || '';
+  const next = `<sheetView showGridLines="${showGridLines}" zoomScale="${zoomScale}" zoomScaleNormal="${zoomScale}" workbookViewId="0"${attrs}>${pane}${existing}</sheetView>`;
+  return sheetXml.replace(match[0], next);
+}
+
+function excelSheetPrXml(sheetXml, setup, ws) {
+  const tabColor = ws?.['!tabColor']?.rgb ? `<tabColor rgb="${excelXmlEscape(ws['!tabColor'].rgb)}"/>` : '';
+  const pageSetup = setup ? '<pageSetUpPr fitToPage="1"/>' : '';
+  if (!tabColor && !pageSetup) return sheetXml;
+  if (/<sheetPr\b/.test(sheetXml)) {
+    let next = sheetXml;
+    if (tabColor) {
+      next = /<tabColor\b/.test(next)
+        ? next.replace(/<tabColor\b[^>]*\/?\s*>/, tabColor)
+        : next.replace(/(<sheetPr\b[^>]*>)/, `$1${tabColor}`);
+    }
+    if (pageSetup) {
+      next = /<pageSetUpPr\b/.test(next)
+        ? next.replace(/<pageSetUpPr\b[^>]*\/?\s*>/, pageSetup)
+        : next.replace(/(<tabColor\b[^>]*\/>|<sheetPr\b[^>]*>)/, `$1${pageSetup}`);
+    }
+    return next;
+  }
+  return sheetXml.replace(/(<worksheet\b[^>]*>)/, `$1<sheetPr>${tabColor}${pageSetup}</sheetPr>`);
+}
+
+function excelPageSetupBlockXml(ws) {
+  const setup = ws?.['!pageSetup'];
+  if (!setup) return '';
+  return `${excelPageSetupXml(setup)}<headerFooter><oddFooter>&amp;L多多 · 商业地产&amp;R第 &amp;P 页 / 共 &amp;N 页</oddFooter></headerFooter>`;
+}
+
+function excelApplyPrintSettings(sheetXml, ws) {
+  const setup = ws?.['!pageSetup'];
+  let next = excelSheetPrXml(sheetXml, setup, ws);
+  next = excelSheetViewXml(next, ws);
+  if (!setup) return next;
+  const block = excelPageSetupBlockXml(ws);
+  if (/<pageSetup\b/.test(next)) return next;
+  if (/<pageMargins\b[^>]*\/>/.test(next)) {
+    return next.replace(/(<pageMargins\b[^>]*\/>)/, `$1${block}`);
+  }
+  return next.replace('</worksheet>', `${block}</worksheet>`);
+}
+
+async function postProcessWorkbookXlsx(bytes, wb) {
+  if (!window.JSZip) return new Blob([bytes], { type: XLSX_MIME });
+  const zip = await window.JSZip.loadAsync(bytes);
+  const workbookFile = zip.file('xl/workbook.xml');
+  const relsFile = zip.file('xl/_rels/workbook.xml.rels');
+  if (!workbookFile || !relsFile) return new Blob([bytes], { type: XLSX_MIME });
+  let workbookXml = await workbookFile.async('string');
+  const relsXml = await relsFile.async('string');
+  const calcPrXml = '<calcPr calcId="0" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>';
+  workbookXml = /<calcPr\b[^>]*\/?\s*>/.test(workbookXml)
+    ? workbookXml.replace(/<calcPr\b[^>]*\/?\s*>/, calcPrXml)
+    : workbookXml.replace('</workbook>', `${calcPrXml}</workbook>`);
+  zip.file('xl/workbook.xml', workbookXml);
+  const stylesFile = zip.file('xl/styles.xml');
+  if (stylesFile) {
+    const stylesXml = await stylesFile.async('string');
+    zip.file('xl/styles.xml', stylesXml.replaceAll('vertical="middle"', 'vertical="center"'));
+  }
+  const relationships = {};
+  for (const match of relsXml.matchAll(/<Relationship\b([^>]+)>/g)) {
+    const id = excelXmlAttr(match[1], 'Id');
+    const target = excelXmlAttr(match[1], 'Target');
+    if (id && target) relationships[id] = target;
+  }
+  for (const match of workbookXml.matchAll(/<sheet\b([^>]+)>/g)) {
+    const name = excelXmlAttr(match[1], 'name');
+    const relId = excelXmlAttr(match[1], 'r:id');
+    const target = relationships[relId];
+    if (!name || !target) continue;
+    const normalized = target.replace(/^\/?xl\//, '').replace(/^\.\//, '');
+    const path = `xl/${normalized}`;
+    const file = zip.file(path);
+    if (!file) continue;
+    const sheetXml = await file.async('string');
+    zip.file(path, excelApplyPrintSettings(sheetXml, wb.Sheets[name]));
+  }
+  const output = await zip.generateAsync({
+    type: 'uint8array',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+    mimeType: XLSX_MIME,
+  });
+  return new Blob([output], { type: XLSX_MIME });
+}
+
+async function workbookBlob(wb) {
+  await ensureXlsxLibrary();
+  await ensureJszipLibrary();
+  const bytes = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true, cellStyles: true, bookSST: true });
+  return postProcessWorkbookXlsx(bytes, wb);
+}
+
+function addSheet(wb, name, rows, widths = []) {
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  if (ws['!ref']) {
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    for (let row = range.s.r; row <= range.e.r; row++) {
+      for (let column = range.s.c; column <= range.e.c; column++) {
+        const cell = ws[XLSX.utils.encode_cell({ r: row, c: column })];
+        if (cell && cell.t === 'n' && !cell.z) cell.z = Number.isInteger(cell.v) ? '0' : '0.00';
+      }
+    }
+  }
+  if (widths.length) ws['!cols'] = widths.map(wch => ({ wch }));
+  wb.SheetNames.push(name);
+  wb.Sheets[name] = ws;
+  return ws;
+}
+
+const EXCEL_THEME = {
+  navy: 'FF103B33',
+  teal: 'FF1D6B57',
+  gold: 'FFD6A84B',
+  goldLight: 'FFF7ECD4',
+  greenLight: 'FFF3F8F5',
+  greenPale: 'FFEAF4EF',
+  cream: 'FFFBF8F1',
+  text: 'FF17211E',
+  muted: 'FF66736F',
+  border: 'FFDDE5E1',
+  borderSoft: 'FFE8EEEA',
+  white: 'FFFFFFFF',
+  input: 'FFFFF7E6',
+  inputText: 'FF1F4E79',
+  danger: 'FFB94A48',
+  grayTab: 'FF7F8C87',
+  blueTab: 'FF4D7D8A',
+};
+
+function excelArgb(hex) {
+  const value = String(hex || '').replace('#', '').toUpperCase();
+  return value.length === 8 ? value : `FF${value.padStart(6, '0')}`;
+}
+
+function excelSide(style = 'thin', color = EXCEL_THEME.border) {
+  return { style, color: { rgb: color } };
+}
+
+function excelBorder({ top = null, bottom = null, left = null, right = null } = {}) {
+  return {
+    ...(top ? { top: excelSide(top.style || 'thin', top.color || EXCEL_THEME.border) } : {}),
+    ...(bottom ? { bottom: excelSide(bottom.style || 'thin', bottom.color || EXCEL_THEME.border) } : {}),
+    ...(left ? { left: excelSide(left.style || 'thin', left.color || EXCEL_THEME.border) } : {}),
+    ...(right ? { right: excelSide(right.style || 'thin', right.color || EXCEL_THEME.border) } : {}),
+  };
+}
+
+function excelStyle({ size = 10, bold = false, italic = false, color = EXCEL_THEME.text, fill = null, horizontal = 'left', vertical = 'center', wrap = false, border = null } = {}) {
+  return {
+    font: { name: EXCEL_FONT, sz: size, bold, italic, color: { rgb: color } },
+    alignment: { horizontal, vertical, wrapText: wrap },
+    ...(fill ? { fill: { patternType: 'solid', fgColor: { rgb: fill } } } : {}),
+    ...(border ? { border } : {}),
+  };
+}
+
+function excelCellText(cell) {
+  if (!cell) return '';
+  return String(cell.w ?? cell.v ?? '').trim();
+}
+
+function excelRowStats(ws, row, startCol, endCol) {
+  let count = 0;
+  let textCount = 0;
+  let numericCount = 0;
+  const values = [];
+  for (let col = startCol; col <= endCol; col++) {
+    const cell = ws[XLSX.utils.encode_cell({ r: row, c: col })];
+    const text = excelCellText(cell);
+    if (text) {
+      count += 1;
+      values.push(text);
+      if (cell?.t === 'n') numericCount += 1;
+      else textCount += 1;
+    }
+  }
+  return { count, textCount, numericCount, values };
+}
+
+function excelVisualLength(value) {
+  return [...String(value || '')].reduce((sum, ch) => sum + (/[\u3400-\u9FFF]/.test(ch) ? 2 : 1), 0);
+}
+
+function excelSheetPurpose(name) {
+  const exact = {
+    '项目概览': '项目核心指标、投资规模与收益结论',
+    '核心参数': '关键假设、税费、融资与估值参数',
+    '项目信息': '项目名称、位置、形态、面积与收费口径',
+    '楼栋收费设置': '按楼栋配置中央空调收费与单价',
+    '商铺明细': '逐铺导入楼栋、楼层、面积、租金与铺位条件',
+    '楼栋楼层填写说明': '楼栋楼层命名、面积与租金列填写规范',
+    '一铺一价核算': '逐铺计租面积、租金、联营和三项费用公式',
+    '参数与公式说明': 'Excel 公式、函数、输入区与复核规则',
+    '项目参数': '本次核算采用的项目基础参数',
+    '业态参考规则': '业态租金、销售基数、扣点率与结算方式',
+    '使用说明': '模板用途、填写顺序与导入规则',
+    '基础参数': '组织、薪酬与筹备期基础参数',
+    '组织架构': '部门、岗位、编制与税前月薪',
+    '薪酬口径说明': '工资、社保、个税和实发口径说明',
+    '个税税率表': '中国综合所得年度税率与速算扣除数',
+    '物业服务模式': '物业工程、保安、保洁服务模式与费率',
+    '筹备期成本': '筹备周期、团队、物业与开办参数',
+    '办公预算': '办公及行政费用项目和周期金额',
+    '招商预算': '招商渠道、活动、物料、差旅和系统费用',
+    '招商渠道核算': '渠道面积、首年月租金和佣金倍数',
+    '招商调整阶段': '阶段性租金调整、出租率和招商投入',
+    '营销常规预算': '年度营销推广、美陈、媒体和会员费用',
+    '开业首年营销': '导视导览与开业美陈专项预算',
+    '维保预算': '电梯、暖通、消防、景观及其他维保',
+    '组织架构与人员成本': '部门、岗位、编制、工资社保和个税',
+    '物业服务模式': '物业服务模式、岗位成本和管理费',
+    '办公与招商预算': '办公行政与年度招商费用明细',
+    '年度营销预算分解': '营销费用金额、权重和费用内容',
+    '运营成本构成': '稳定期运营成本项目、金额和占比',
+    '阶段成本汇总': '建设期、筹备期和运营期成本汇总',
+    '税费与规费统计': '增值税、房产税、土地使用税、附加及所得税',
+    '筹备期成本明细': '筹备团队、物业服务与行政开办明细',
+    '资金计划': '月度资金缺口、资本金和现金流安排',
+    '资金用途明细': '建设、筹备招商和开业首年的逐项资金用途与来源',
+    '项目时间轴': '立项、开工、竣工、招商、开业、运营结束及关键资金节点',
+    '招商开业里程碑': '分阶段出租率、可实现月租金和年化租金',
+    '公式与参数': '计算公式、函数和关键参数说明',
+    '函数注解': 'Excel 函数语法、含义与使用注意事项',
+    '投资构成': '土地、工程、装修、设备、预备费与开办投入',
+    '投资构成明细': '各项投资的面积、单价、合同额、公式和金额明细',
+    '楼层均价': '按楼栋楼层汇总面积、租金和三项费用',
+    '租赁联营规则': '业态租金、扣点和行业参考区间',
+    '周边市场分析': '竞品租金分位、项目定价位置与结论',
+    '3-5公里商业侦测': '周边商业供给、交通、居住、竞品和机会',
+    '竞品租金样本': '3–5公里竞品租金调查原始样本',
+    '敏感性分析': '租金与投资变化对项目收益的影响',
+    '分析结论': '系统测算结论、建议与诊断提示',
+  };
+  if (exact[name]) return exact[name];
+  if (/^年度收益/.test(name)) return '按运营年度列示收入、成本、税费、NOI和现金流';
+  if (/^封面|目录/.test(name)) return '文件封面与工作表导航';
+  return '测算与复核数据';
+}
+
+function formatCoverSheet(ws, sheetNames, options) {
+  const projectName = options.projectName || options.title || '商业地产项目';
+  const navEntries = sheetNames.filter(name => name !== '封面');
+  const navigationTitleRow = 10;
+  const navigationHeaderRow = 11;
+  const navigationStartRow = 12;
+  const legendTitleRow = navigationStartRow + navEntries.length + 1;
+  const legendInputRow = legendTitleRow + 1;
+  const legendFormulaRow = legendInputRow + 1;
+  const legendTotalRow = legendFormulaRow + 1;
+  const readingGuideRow = legendTotalRow + 2;
+  const boundaryRow = readingGuideRow + 1;
+  const rows = [
+    ['', '多多 · 商业地产', '', '', '', ''],
+    ['', '', '', '', '', ''],
+    ['', options.title || '商业地产投资测算工作簿', '', '', '', ''],
+    ['', options.subtitle || '输入、计算、复核与汇报一体化工作簿', '', '', '', ''],
+    ['', '', '', '', '', ''],
+    ['', '项目名称', projectName, '', '', ''],
+    ['', '文件类型', options.fileKind || '投资测算工作簿', '', '', ''],
+    ['', '金额口径', options.currencyNote || '人民币（CNY）；金额单位按各工作表表头执行', '', '', ''],
+    ['', '生成日期', options.generatedAt || new Date().toLocaleDateString('zh-CN'), '', '', ''],
+    ['', '', '', '', '', ''],
+    ['', '工作表导航', '', '', '', ''],
+    ['', '序号', '工作表', '主要内容', '', ''],
+    ...navEntries.map((name, index) => ['', index + 1, name, excelSheetPurpose(name), '', '']),
+    ['', '', '', '', '', ''],
+    ['', '颜色图例', '', '', '', ''],
+    ['', '输入区', '浅金色', '需要填写的项目数据、面积、租金和费用参数', '', ''],
+    ['', '计算区', '浅绿色', '系统自动计算，请勿手工覆盖，除非有明确复核依据', '', ''],
+    ['', '合计区', '深绿色', '关键总计、回报指标和结论', '', ''],
+    ['', '', '', '', '', ''],
+    ['', '读表顺序', '先看项目概览和分析结论，再复核核心参数、收入成本、税费与年度现金流。', '', '', ''],
+    ['', '重要边界', options.note || '本工作簿用于投资初筛和方案比较，不替代可研、审计、资产评估或税务鉴证。', '', '', ''],
+  ];
+  const header = XLSX.utils.aoa_to_sheet(rows);
+  ws['!ref'] = header['!ref'];
+  Object.entries(header).forEach(([key, value]) => { if (!key.startsWith('!')) ws[key] = value; });
+  ws['!cols'] = [{ wch: 3 }, { wch: 16 }, { wch: 28 }, { wch: 72 }, { wch: 4 }, { wch: 4 }];
+  ws['!merges'] = [
+    { s: { r: 0, c: 1 }, e: { r: 0, c: 3 } },
+    { s: { r: 2, c: 1 }, e: { r: 2, c: 3 } },
+    { s: { r: 3, c: 1 }, e: { r: 3, c: 3 } },
+    { s: { r: 5, c: 2 }, e: { r: 5, c: 3 } },
+    { s: { r: 6, c: 2 }, e: { r: 6, c: 3 } },
+    { s: { r: 7, c: 2 }, e: { r: 7, c: 3 } },
+    { s: { r: 8, c: 2 }, e: { r: 8, c: 3 } },
+    { s: { r: readingGuideRow, c: 2 }, e: { r: readingGuideRow, c: 3 } },
+    { s: { r: boundaryRow, c: 2 }, e: { r: boundaryRow, c: 3 } },
+  ];
+  const put = (r, c, style) => {
+    const addr = XLSX.utils.encode_cell({ r, c });
+    if (!ws[addr]) ws[addr] = { t: 's', v: '' };
+    ws[addr].s = style;
+  };
+  put(0, 1, excelStyle({ size: 10, bold: true, color: EXCEL_THEME.teal, border: excelBorder({ bottom: { style: 'medium', color: EXCEL_THEME.gold } }) }));
+  put(2, 1, excelStyle({ size: 20, bold: true, color: EXCEL_THEME.navy, vertical: 'center' }));
+  put(3, 1, excelStyle({ size: 10, color: EXCEL_THEME.muted, vertical: 'center' }));
+  for (const r of [5, 6, 7, 8]) {
+    put(r, 1, excelStyle({ size: 10, bold: true, color: EXCEL_THEME.muted, fill: EXCEL_THEME.greenLight, border: excelBorder({ bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+    put(r, 2, excelStyle({ size: 10, color: EXCEL_THEME.text, fill: EXCEL_THEME.white, border: excelBorder({ bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+  }
+  put(navigationTitleRow, 1, excelStyle({ size: 14, bold: true, color: EXCEL_THEME.navy, border: excelBorder({ bottom: { style: 'medium', color: EXCEL_THEME.gold } }) }));
+  for (let c = 1; c <= 3; c++) put(navigationHeaderRow, c, excelStyle({ size: 10, bold: true, color: EXCEL_THEME.white, fill: EXCEL_THEME.navy, horizontal: 'center', border: excelBorder({ bottom: { style: 'thin', color: EXCEL_THEME.white }, left: { style: 'thin', color: EXCEL_THEME.white }, right: { style: 'thin', color: EXCEL_THEME.white } }) }));
+  for (let r = navigationStartRow; r < navigationStartRow + navEntries.length; r++) {
+    const isAlt = (r - navigationStartRow) % 2 === 1;
+    for (let c = 1; c <= 3; c++) put(r, c, excelStyle({ size: 10, color: EXCEL_THEME.text, fill: isAlt ? EXCEL_THEME.greenLight : EXCEL_THEME.white, horizontal: c === 1 ? 'center' : 'left', border: excelBorder({ bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+  }
+  put(legendTitleRow, 1, excelStyle({ size: 10, bold: true, color: EXCEL_THEME.navy }));
+  put(legendInputRow, 1, excelStyle({ size: 9, color: EXCEL_THEME.muted }));
+  put(legendInputRow, 2, excelStyle({ size: 9, bold: true, color: EXCEL_THEME.inputText, fill: EXCEL_THEME.input, horizontal: 'center', border: excelBorder({ top: { style: 'thin', color: EXCEL_THEME.gold }, bottom: { style: 'thin', color: EXCEL_THEME.gold }, left: { style: 'thin', color: EXCEL_THEME.gold }, right: { style: 'thin', color: EXCEL_THEME.gold } }) }));
+  put(legendInputRow, 3, excelStyle({ size: 9, color: EXCEL_THEME.muted }));
+  put(legendFormulaRow, 1, excelStyle({ size: 9, color: EXCEL_THEME.muted }));
+  put(legendFormulaRow, 2, excelStyle({ size: 9, bold: true, color: EXCEL_THEME.teal, fill: EXCEL_THEME.greenLight, horizontal: 'center', border: excelBorder({ top: { style: 'thin', color: EXCEL_THEME.border }, bottom: { style: 'thin', color: EXCEL_THEME.border }, left: { style: 'thin', color: EXCEL_THEME.border }, right: { style: 'thin', color: EXCEL_THEME.border } }) }));
+  put(legendFormulaRow, 3, excelStyle({ size: 9, color: EXCEL_THEME.muted }));
+  put(legendTotalRow, 1, excelStyle({ size: 9, color: EXCEL_THEME.muted }));
+  put(legendTotalRow, 2, excelStyle({ size: 9, bold: true, color: EXCEL_THEME.white, fill: EXCEL_THEME.navy, horizontal: 'center' }));
+  put(legendTotalRow, 3, excelStyle({ size: 9, color: EXCEL_THEME.muted }));
+  put(readingGuideRow, 1, excelStyle({ size: 9, bold: true, color: EXCEL_THEME.muted, fill: EXCEL_THEME.cream, border: excelBorder({ bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+  put(readingGuideRow, 2, excelStyle({ size: 9, color: EXCEL_THEME.muted, italic: true, fill: EXCEL_THEME.cream, border: excelBorder({ bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+  put(boundaryRow, 1, excelStyle({ size: 9, color: EXCEL_THEME.muted, italic: true, fill: EXCEL_THEME.cream, border: excelBorder({ top: { style: 'thin', color: EXCEL_THEME.borderSoft }, bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+  put(boundaryRow, 2, excelStyle({ size: 9, color: EXCEL_THEME.muted, italic: true, fill: EXCEL_THEME.cream, border: excelBorder({ top: { style: 'thin', color: EXCEL_THEME.borderSoft }, bottom: { style: 'thin', color: EXCEL_THEME.borderSoft } }) }));
+  ws['!rows'] = [{ hpt: 24 }, { hpt: 8 }, { hpt: 34 }, { hpt: 22 }, { hpt: 10 }, { hpt: 20 }, { hpt: 20 }, { hpt: 20 }, { hpt: 20 }, { hpt: 10 }, { hpt: 24 }, { hpt: 24 }];
+  ws['!rows'][legendTitleRow] = { hpt: 22 };
+  ws['!rows'][legendInputRow] = { hpt: 20 };
+  ws['!rows'][legendFormulaRow] = { hpt: 20 };
+  ws['!rows'][legendTotalRow] = { hpt: 20 };
+  ws['!rows'][readingGuideRow] = { hpt: 28 };
+  ws['!rows'][boundaryRow] = { hpt: 34 };
+  ws['!pageSetup'] = { orientation: 'landscape', fitToWidth: 1, fitToHeight: 1, paperSize: 9 };
+  ws['!margins'] = { left: 0.45, right: 0.45, top: 0.55, bottom: 0.55, header: 0.2, footer: 0.2 };
+  ws['!sheetViews'] = [{ showGridLines: false }];
+}
+
+function findExcelHeaderRow(ws, range) {
+  const start = range.s.r;
+  const end = Math.min(range.e.r, start + 10);
+  const firstStats = excelRowStats(ws, start, range.s.c, range.e.c);
+  const titleRow = firstStats.count === 1 ? start : -1;
+  const searchStart = titleRow >= 0 ? titleRow + 1 : start;
+  for (let row = searchStart; row <= end; row++) {
+    const stats = excelRowStats(ws, row, range.s.c, range.e.c);
+    if (stats.count >= 2 && stats.textCount >= 2) return { headerRow: row, titleRow };
+  }
+  return { headerRow: -1, titleRow };
+}
+
+function excelFreezeForSheet(sheetName, headerRow, tableLastRow) {
+  if (headerRow < 0 || tableLastRow - headerRow < 10) return null;
+  const ySplit = headerRow + 1;
+  let xSplit = 0;
+  if (/年度收益/.test(sheetName)) xSplit = 1;
+  else if (/一铺一价|商铺明细|组织架构|组织架构与人员成本|物业服务岗位|招商渠道|营销常规|办公预算|维保预算/.test(sheetName)) xSplit = /一铺一价|商铺明细/.test(sheetName) ? 3 : 2;
+  return { xSplit, ySplit };
+}
+
+function formatDataSheet(ws, sheetName, profile, inputSheets) {
+  if (!ws || !ws['!ref']) return;
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  const noHeader = new Set(['项目概览', '使用说明']);
+  const explicitHeaderRows = { '项目时间轴': 19 };
+  const referenceOnly = new Set(['薪酬口径说明', '个税税率表']);
+  const detected = noHeader.has(sheetName)
+    ? { headerRow: -1, titleRow: excelRowStats(ws, range.s.r, range.s.c, range.e.c).count === 1 ? range.s.r : -1 }
+    : explicitHeaderRows[sheetName] !== undefined
+      ? { headerRow: explicitHeaderRows[sheetName], titleRow: 0 }
+      : findExcelHeaderRow(ws, range);
+  const { headerRow, titleRow } = detected;
+  const headerCount = headerRow >= 0 ? excelRowStats(ws, headerRow, range.s.c, range.e.c).count : 0;
+  const tableEndCol = headerRow >= 0 ? Math.max(range.s.c + headerCount - 1, range.s.c + 1) : range.e.c;
+  let tableLastRow = headerRow;
+  if (headerRow >= 0) {
+    let sawData = false;
+    for (let row = headerRow + 1; row <= range.e.r; row++) {
+      const stats = excelRowStats(ws, row, range.s.c, tableEndCol);
+      if (stats.count >= 2) {
+        sawData = true;
+        tableLastRow = row;
+      } else if (sawData && stats.count === 0) {
+        break;
+      }
+    }
+  }
+  if (titleRow >= 0) {
+    const existing = (ws['!merges'] || []).find(m => m.s.r === titleRow && m.s.c === range.s.c);
+    if (!existing && tableEndCol > range.s.c) {
+      ws['!merges'] = [...(ws['!merges'] || []), { s: { r: titleRow, c: range.s.c }, e: { r: titleRow, c: tableEndCol } }];
+    }
+  }
+  for (let row = range.s.r; row <= range.e.r; row++) {
+    for (let col = range.s.c; col <= range.e.c; col++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: row, c: col })];
+      if (!cell) continue;
+      if (!cell.s) cell.s = excelStyle({ size: 10, color: EXCEL_THEME.text });
+      if (cell.t === 'n' && !cell.z) cell.z = '#,##0.00';
+    }
+  }
+  if (titleRow >= 0) {
+    const addr = XLSX.utils.encode_cell({ r: titleRow, c: range.s.c });
+    if (ws[addr]) ws[addr].s = excelStyle({ size: 15, bold: true, color: EXCEL_THEME.navy, border: excelBorder({ bottom: { style: 'medium', color: EXCEL_THEME.gold } }) });
+    if (!ws['!rows']) ws['!rows'] = [];
+    ws['!rows'][titleRow] = { hpt: 30 };
+  }
+  if (headerRow >= 0) {
+    for (let col = range.s.c; col <= tableEndCol; col++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: headerRow, c: col })];
+      if (!cell) continue;
+      cell.s = excelStyle({ size: 10, bold: true, color: EXCEL_THEME.white, fill: EXCEL_THEME.navy, horizontal: 'center', wrap: true, border: excelBorder({ bottom: { style: 'medium', color: EXCEL_THEME.gold }, left: { style: 'thin', color: EXCEL_THEME.white }, right: { style: 'thin', color: EXCEL_THEME.white } }) });
+    }
+    if (!ws['!rows']) ws['!rows'] = [];
+    ws['!rows'][headerRow] = { hpt: 28 };
+    if (tableLastRow > headerRow + 2 && tableEndCol >= range.s.c + 1) {
+      ws['!autofilter'] = { ref: `${XLSX.utils.encode_cell({ r: headerRow, c: range.s.c })}:${XLSX.utils.encode_cell({ r: tableLastRow, c: tableEndCol })}` };
+    }
+    ws['!excelFreeze'] = excelFreezeForSheet(sheetName, headerRow, tableLastRow);
+  }
+  const inputSheetNames = new Set(inputSheets || []);
+  const firstBodyRow = headerRow >= 0 ? headerRow + 1 : (titleRow >= 0 ? titleRow + 1 : range.s.r);
+  for (let row = firstBodyRow; row <= range.e.r; row++) {
+    const stats = excelRowStats(ws, row, range.s.c, range.e.c);
+    if (!stats.count) continue;
+    const joined = stats.values.join(' ');
+    const isTotal = /^(合计|总计|小计)|合计$|总计$|小计$/.test(joined) || /合计.*(元|万元|%)/.test(joined);
+    const isSection = stats.count === 1 && row > firstBodyRow && !/说明|填写|边界|口径/.test(joined);
+    const isNote = stats.count === 1 && /说明|填写|边界|口径|注意|建议|导入后|请勿/.test(joined);
+    const longRow = excelVisualLength(joined) > 54;
+    const rowHeight = isNote || longRow ? 24 : 20;
+    if (!ws['!rows']) ws['!rows'] = [];
+    ws['!rows'][row] = { hpt: rowHeight };
+    for (let col = range.s.c; col <= range.e.c; col++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: row, c: col })];
+      if (!cell) continue;
+      const header = headerRow >= 0
+        ? excelCellText(ws[XLSX.utils.encode_cell({ r: headerRow, c: col })])
+        : excelCellText(ws[XLSX.utils.encode_cell({ r: row, c: range.s.c })]);
+      const isNumeric = cell.t === 'n';
+      const isFormula = Boolean(cell.f);
+      const isInput = profile === 'template' && inputSheetNames.has(sheetName) && !referenceOnly.has(sheetName) && !isFormula;
+      let fill = row % 2 === 0 ? EXCEL_THEME.greenLight : EXCEL_THEME.white;
+      let color = EXCEL_THEME.text;
+      let bold = false;
+      let fontStyle = false;
+      if (isNote) {
+        fill = EXCEL_THEME.cream;
+        color = EXCEL_THEME.muted;
+        fontStyle = true;
+      } else if (isSection) {
+        fill = EXCEL_THEME.greenPale;
+        color = EXCEL_THEME.teal;
+        bold = true;
+      } else if (isTotal) {
+        fill = EXCEL_THEME.greenPale;
+        color = EXCEL_THEME.navy;
+        bold = true;
+      } else if (isInput) {
+        fill = EXCEL_THEME.input;
+        color = EXCEL_THEME.inputText;
+      } else if (isFormula) {
+        fill = EXCEL_THEME.greenLight;
+        color = EXCEL_THEME.text;
+      }
+      cell.s = excelStyle({
+        size: 10,
+        bold,
+        italic: fontStyle,
+        color,
+        fill,
+        horizontal: isNumeric ? 'right' : 'left',
+        wrap: joined.length > 36,
+        border: excelBorder({ bottom: { style: isTotal ? 'medium' : 'thin', color: isTotal ? EXCEL_THEME.gold : EXCEL_THEME.borderSoft } }),
+      });
+      const genericNumberFormat = !cell.z || ['0', '0.00', 'General'].includes(String(cell.z));
+      if (isNumeric && genericNumberFormat) {
+        if (/率|比例|占比|IRR|收益率/i.test(header) && Math.abs(Number(cell.v || 0)) <= 1) cell.z = '0.00%';
+        else if (/年|数量|人数|楼层|月数|期限|数量/.test(header)) cell.z = '#,##0';
+        else if (/金额|收入|成本|投资|租金|费用|工资|税费|现金|净收益|NOI|NPV|价值|支出|收益|预算|单价|月薪/.test(header)) cell.z = '#,##0.00;[Red](#,##0.00);-';
+        else cell.z = '#,##0.00';
+      }
+    }
+  }
+  const widths = [];
+  for (let col = range.s.c; col <= range.e.c; col++) {
+    let maxLen = 8;
+    let numericCells = 0;
+    let populatedCells = 0;
+    for (let row = range.s.r; row <= Math.min(range.e.r, range.s.r + 240); row++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: row, c: col })];
+      if (!cell) continue;
+      populatedCells += 1;
+      if (cell.t === 'n') numericCells += 1;
+      maxLen = Math.max(maxLen, excelVisualLength(excelCellText(cell)));
+    }
+    const current = Number(ws['!cols']?.[col]?.wch || 0);
+    const numericColumn = populatedCells > 0 && numericCells / populatedCells >= 0.6;
+    const widthCap = numericColumn ? 24 : 52;
+    widths.push({ wch: Math.max(numericColumn ? 10 : 8, Math.min(widthCap, Math.max(current, maxLen + 2))) });
+  }
+  ws['!cols'] = widths;
+  for (let row = firstBodyRow; row <= range.e.r; row++) {
+    const stats = excelRowStats(ws, row, range.s.c, tableEndCol);
+    if (!stats.count) continue;
+    let maxLines = 1;
+    for (let col = range.s.c; col <= tableEndCol; col++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: row, c: col })];
+      if (!cell) continue;
+      const text = excelCellText(cell);
+      const available = Math.max(8, Number(widths[col - range.s.c]?.wch || 16) - 2);
+      maxLines = Math.max(maxLines, Math.ceil(excelVisualLength(text) / available));
+    }
+    if (!ws['!rows']) ws['!rows'] = [];
+    ws['!rows'][row] = { hpt: Math.max(20, Math.min(66, 17 + (maxLines - 1) * 11)) };
+  }
+  const lastRow = range.e.r;
+  for (let row = Math.max(0, headerRow); row <= lastRow; row++) {
+    if (row < 0) continue;
+    const leftCell = ws[XLSX.utils.encode_cell({ r: row, c: range.s.c })];
+    const rightCell = ws[XLSX.utils.encode_cell({ r: row, c: tableEndCol })];
+    if (leftCell) leftCell.s = { ...(leftCell.s || {}), border: { ...(leftCell.s?.border || {}), left: excelSide('thin', EXCEL_THEME.border) } };
+    if (rightCell) rightCell.s = { ...(rightCell.s || {}), border: { ...(rightCell.s?.border || {}), right: excelSide('thin', EXCEL_THEME.border) } };
+  }
+  const wideTable = tableEndCol - range.s.c > 8;
+  ws['!pageSetup'] = { orientation: tableEndCol - range.s.c > 5 ? 'landscape' : 'portrait', fitToWidth: 1, fitToHeight: 0, paperSize: 9 };
+  ws['!margins'] = { left: 0.3, right: 0.3, top: 0.45, bottom: 0.45, header: 0.2, footer: 0.2 };
+  ws['!sheetViews'] = [{ showGridLines: false, zoomScale: wideTable ? 80 : 90 }];
+}
+
+function formatWorkbook(wb, options = {}) {
+  const profile = options.profile || 'report';
+  const inputSheets = options.inputSheets || [];
+  if (options.cover !== false && !wb.SheetNames.includes('封面')) {
+    const cover = XLSX.utils.aoa_to_sheet([['']]);
+    addSheet(wb, '封面', [['']], [3, 16, 28, 72, 4, 4]);
+    wb.Sheets['封面'] = cover;
+    wb.SheetNames = ['封面', ...wb.SheetNames.filter(name => name !== '封面')];
+  }
+  const sheetNames = [...wb.SheetNames];
+  if (sheetNames.includes('封面')) formatCoverSheet(wb.Sheets['封面'], sheetNames, options);
+  sheetNames.filter(name => name !== '封面').forEach(name => formatDataSheet(wb.Sheets[name], name, profile, inputSheets));
+  wb.Props = {
+    ...(wb.Props || {}),
+    Title: options.title || '多多 · 商业地产投资测算工作簿',
+    Subject: options.subtitle || '商业地产投资测算与复核',
+    Author: '多多 · 商业地产',
+    Company: '多多 · 商业地产',
+    Comments: '统一格式：深绿色表头、浅金色输入区、浅绿色计算区、深色合计行。',
+  };
+  wb.Workbook ||= {};
+  wb.Workbook.Sheets ||= [];
+  wb.Workbook.CalcPr = { ...(wb.Workbook.CalcPr || {}), calcMode: 'auto', fullCalcOnLoad: true, forceFullCalc: true };
+  wb.SheetNames.forEach((name, index) => {
+    const primary = index === 0 ? EXCEL_THEME.gold : ['项目概览', '核心参数', '一铺一价核算', '分析结论'].includes(name) ? EXCEL_THEME.navy : /说明|注解|口径/.test(name) ? EXCEL_THEME.grayTab : /市场|竞品|侦测/.test(name) ? EXCEL_THEME.blueTab : EXCEL_THEME.teal;
+    wb.Workbook.Sheets[index] = { ...(wb.Workbook.Sheets[index] || {}), TabColor: { rgb: primary } };
+    wb.Sheets[name]['!tabColor'] = { rgb: primary };
+  });
+  return wb;
+}
+
+function setSheetColumnNumberFormat(ws, zeroBasedColumns, format = '0.00') {
+  if (!ws?.['!ref']) return;
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  for (let row = range.s.r; row <= range.e.r; row++) {
+    for (const column of zeroBasedColumns) {
+      const address = XLSX.utils.encode_cell({ r: row, c: column });
+      if (ws[address] && typeof ws[address].v === 'number') ws[address].z = format;
+    }
+  }
+}
+
+function setFormulaCell(ws, rowNumber, zeroBasedColumn, formula, cachedValue, format = '0.00') {
+  const address = XLSX.utils.encode_cell({ r: rowNumber - 1, c: zeroBasedColumn });
+  ws[address] = { t: 'n', f: String(formula || '').replace(/^=/, ''), v: Number(cachedValue) || 0 };
+  if (format) ws[address].z = format;
+  return address;
+}
+
+function exportShopAuditWorkbook(result) {
+  const model = result.model || {};
+  const shops = Array.isArray(result.shops) ? result.shops : [];
+  const wb = XLSX.utils.book_new();
+  const basisLabel = value => value === 'building' ? '建筑面积' : '实用面积';
+  const settlementLabel = value => value === 'concession' ? '纯联营扣点' : value === 'guarantee_or_concession' ? '保底与联营扣点取高' : '纯租金';
+  const headers = [
+    '楼栋', '楼层', '铺位号', '业态', '状态', '建筑面积（㎡）', '实用面积（㎡）',
+    '商铺计租例外（可选）', '实际计租口径（自动）', '商户计租面积（㎡）',
+    '所属楼层租金单价（元/㎡/月）', '联营位置修正率', '执行租金单价（元/㎡/月）',
+    '销售基数（元/㎡/月）', '扣点率', '结算方式',
+    '保底租金收入（测算参考）', '联营扣点收入（测算参考）', '测算租金收入（实际计入）',
+    '物业管理费单价（元/㎡/月）', '商业管理费单价（元/㎡/月）', '中央空调费单价（元/㎡/月）',
+    '物业费收入（元/月）', '商业管理费收入（元/月）', '中央空调费收入（元/月）', '三项费用合计（元/月）',
+    '租金及三项费用合计（元/月）', '年化收入（万元/年）', '位置条件', '备注'
+  ];
+  const rows = [headers];
+  shops.forEach(shop => {
+    const totalMonthly = Number(shop.monthlyRevenue || 0) + Number(shop.monthlyServiceFee || 0);
+    rows.push([
+      shop.building || '1号楼', shop.floor || '', shop.id || '', shop.category || '', shop.status || '',
+      roundArea(shop.buildingArea), roundArea(shop.leasableArea),
+      shop.rentAreaBasisOverride ? basisLabel(shop.rentAreaBasis) : '继承上级默认',
+      basisLabel(shop.rentAreaBasis), roundArea(shop.rentArea),
+      Number(shop.baseRent || 0), Number(shop.conditionPremium || 0), Number(shop.rent || 0),
+      Number(shop.salesPerSqmMonth || 0), Number(shop.concessionRate || 0), settlementLabel(shop.settlementMode),
+      Number(shop.guaranteeRevenue || 0), Number(shop.concessionRevenue || 0), Number(shop.monthlyRevenue || 0),
+      Number(shop.propertyFee || 0), Number(shop.commercialManagementFee || 0), Number(shop.centralAcFee || 0),
+      Number(shop.monthlyPropertyFee || 0), Number(shop.monthlyCommercialManagementFee || 0), Number(shop.monthlyCentralAcFee || 0), Number(shop.monthlyServiceFee || 0),
+      totalMonthly, totalMonthly * 12 / 10000,
+      (shop.appliedConditions || []).join('、'), shop.note || ''
+    ]);
+  });
+  const ws = addSheet(wb, '一铺一价核算', rows, [12, 9, 15, 14, 10, 15, 15, 20, 18, 18, 20, 14, 20, 20, 12, 22, 20, 20, 20, 22, 22, 22, 18, 20, 20, 20, 22, 20, 24, 32]);
+  shops.forEach((shop, index) => {
+    const row = index + 2;
+    const totalMonthly = Number(shop.monthlyRevenue || 0) + Number(shop.monthlyServiceFee || 0);
+    setFormulaCell(ws, row, 9, `IF(I${row}="建筑面积",F${row},G${row})`, shop.rentArea);
+    setFormulaCell(ws, row, 12, `K${row}`, shop.rent);
+    setFormulaCell(ws, row, 16, `J${row}*M${row}`, shop.guaranteeRevenue);
+    setFormulaCell(ws, row, 17, `J${row}*N${row}*O${row}`, shop.concessionRevenue);
+    setFormulaCell(ws, row, 18, `IF(P${row}="纯联营扣点",R${row},IF(P${row}="保底与联营扣点取高",MAX(Q${row},R${row}),Q${row}))`, shop.monthlyRevenue);
+    setFormulaCell(ws, row, 22, `J${row}*T${row}`, shop.monthlyPropertyFee);
+    setFormulaCell(ws, row, 23, `J${row}*U${row}`, shop.monthlyCommercialManagementFee);
+    setFormulaCell(ws, row, 24, `J${row}*V${row}`, shop.monthlyCentralAcFee);
+    setFormulaCell(ws, row, 25, `SUM(W${row}:Y${row})`, shop.monthlyServiceFee);
+    setFormulaCell(ws, row, 26, `S${row}+Z${row}`, totalMonthly);
+    setFormulaCell(ws, row, 27, `AA${row}*12/10000`, totalMonthly * 12 / 10000);
+  });
+  if (shops.length) {
+    const last = shops.length + 1;
+    const totalRow = last + 1;
+    const totalValues = Array(headers.length).fill('');
+    totalValues[2] = '合计';
+    totalValues[5] = shops.reduce((sum, item) => sum + Number(item.buildingArea || 0), 0);
+    totalValues[6] = shops.reduce((sum, item) => sum + Number(item.leasableArea || 0), 0);
+    totalValues[9] = shops.reduce((sum, item) => sum + Number(item.rentArea || 0), 0);
+    totalValues[16] = shops.reduce((sum, item) => sum + Number(item.guaranteeRevenue || 0), 0);
+    totalValues[17] = shops.reduce((sum, item) => sum + Number(item.concessionRevenue || 0), 0);
+    totalValues[18] = shops.reduce((sum, item) => sum + Number(item.monthlyRevenue || 0), 0);
+    totalValues[22] = shops.reduce((sum, item) => sum + Number(item.monthlyPropertyFee || 0), 0);
+    totalValues[23] = shops.reduce((sum, item) => sum + Number(item.monthlyCommercialManagementFee || 0), 0);
+    totalValues[24] = shops.reduce((sum, item) => sum + Number(item.monthlyCentralAcFee || 0), 0);
+    totalValues[25] = shops.reduce((sum, item) => sum + Number(item.monthlyServiceFee || 0), 0);
+    totalValues[26] = shops.reduce((sum, item) => sum + Number(item.monthlyRevenue || 0) + Number(item.monthlyServiceFee || 0), 0);
+    totalValues[27] = totalValues[26] * 12 / 10000;
+    XLSX.utils.sheet_add_aoa(ws, [totalValues], { origin: -1 });
+    const totalFormulaColumns = [
+      [5, 'SUM', 5], [6, 'SUM', 6], [9, 'SUM', 9], [16, 'SUM', 16], [17, 'SUM', 17], [18, 'SUM', 18],
+      [22, 'SUM', 22], [23, 'SUM', 23], [24, 'SUM', 24], [25, 'SUM', 25], [26, 'SUM', 26]
+    ];
+    totalFormulaColumns.forEach(([column, fn, valueColumn]) => setFormulaCell(ws, totalRow, column, `${fn}(${XLSX.utils.encode_col(column)}2:${XLSX.utils.encode_col(column)}${last})`, totalValues[valueColumn]));
+    setFormulaCell(ws, totalRow, 27, `AA${totalRow}*12/10000`, totalValues[27]);
+  }
+  setSheetColumnNumberFormat(ws, [5, 6, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27], '0.00');
+  setSheetColumnNumberFormat(ws, [14], '0.00%');
+
+  addSheet(wb, '参数与公式说明', [
+    ['一铺一价核算表：公式、函数与修改说明'],
+    ['本表由系统按当前项目参数生成。人工复核可修改“输入列”，公式列会自动重算；保存后可从“商铺收益”页重新导入。'],
+    [''],
+    ['列名', '性质', 'Excel公式/计算逻辑', '涉及函数', '调整建议'],
+    ['商户计租面积', '公式', '=IF(实际计租口径="建筑面积", 建筑面积, 实用面积)', 'IF', '实际计租口径由项目统一口径、楼层口径或单铺计租例外确定，仅影响计租面积。'],
+    ['最终租金', '公式', '=所属楼层租金单价', '—', '楼层租金单价是唯一执行单价；系统不乘业态系数、不叠加位置条件溢价。'],
+    ['保底租金收入（测算参考）', '公式', '=商户计租面积×最终租金', '乘法', '这是保底模式的测算值，是否计入最终收入由“结算方式”决定。'],
+    ['联营扣点收入（测算参考）', '公式', '=商户计租面积×销售基数×扣点率', '乘法', '这是联营扣点模式的测算值，纯租金时仅作参考，不计入最终收入。'],
+    ['测算租金收入（实际计入）', '公式', '=IF(结算方式="纯联营扣点",联营收入,IF(结算方式="保底与联营扣点取高",MAX(保底收入,联营收入),保底收入))', 'IF / MAX', '这是当前结算方式下真正计入的租金收入；纯租金只取保底。'],
+    ['物业费收入', '公式', '=商户计租面积×物业管理费单价', '乘法', '全项目统一使用物业管理费单价，确认单价是否为元/㎡/月。'],
+    ['商业管理费收入', '公式', '=商户计租面积×商业管理费单价', '乘法', '商业管理费应与物业管理费分开核对。'],
+    ['中央空调费收入', '公式', '=商户计租面积×中央空调费单价', '乘法', '未开通中央空调的楼栋按0核算。'],
+    ['三项费用合计', '公式', '=物业费收入+商业管理费收入+中央空调费收入', 'SUM', '三项费用均为元/月。'],
+    ['年化收入', '公式', '=(测算租金收入+三项费用合计)×12÷10000', 'SUM / 乘除', '输出单位为万元/年，表示满租状态下的年化收入。'],
+    ['可修改输入列', '输入', '建筑面积、实用面积、计租例外和铺位属性；租金单价、物业费、商管费及空调费按系统当前执行单价统一生成', '—', '修改铺位属性后请保存Excel，再使用系统“导入已审核核算表”回传。'],
+    ['只读参考列', '参考', '实际计租口径、销售基数、扣点率、结算方式、位置条件、备注', '—', '用于核对当前系统采用的规则；主要口径应回到系统页面调整。'],
+    [''],
+    ['重要说明', '本表公式与系统当前计算逻辑一致，但Excel人工改写不会自动同步到云端，必须重新导入系统。'],
+  ], [24, 12, 92, 24, 58]);
+
+  addSheet(wb, '项目参数', [
+    ['参数', '当前值', '说明'],
+    ['项目名称', model.project?.name || result.summary?.projectName || ''],
+    ['项目位置', model.project?.location || result.summary?.location || ''],
+    ['商户租金默认口径', basisLabel(model.project?.rentAreaBasis), '楼层可在“楼层均价与面积”中覆盖，单铺可在编辑铺位时设置例外'],
+    ['项目总建筑面积（㎡）', Number(result.summary?.grossFloorArea || 0)],
+    ['可租赁面积（㎡）', Number(result.summary?.leasableArea || 0)],
+    ['铺位数量', shops.length],
+    ['满租月租金收入（元）', Number(result.summary?.totalMonthlyRent || 0)],
+    ['测算口径', '商户计租面积×租金单价；物业费、商管费、空调费分别按同一计租面积核算'],
+    ['导出时间', new Date().toLocaleString('zh-CN')],
+  ], [30, 30, 72]);
+
+  addSheet(wb, '业态参考规则', [
+    ['业态', '参考租金（元/㎡/月）', '销售基数（元/㎡/月）', '扣点率', '结算方式', '支付方式', '保证金月数', '预付租金月数', '说明'],
+    ...(model.categories || []).map(item => [item.name || '', Number(item.rent || 0), Number(item.salesPerSqmMonth || 0), Number(item.concessionRate || 0), settlementLabel(item.revenueMode === 'inherit' ? model.project?.revenueModel : item.revenueMode), item.paymentMode || 'inherit', item.depositMonths ?? '', item.prepaidRentMonths ?? '', '用于一铺一价核算表中的销售基数、扣点率、结算方式和现金收款参考']),
+  ], [18, 24, 26, 14, 24, 22, 16, 18, 62]);
+  return formatWorkbook(wb, {
+    profile: 'report',
+    title: '一铺一价核算与人工复核表',
+    subtitle: '逐铺面积、租金、结算方式、三项费用与年化收入复核',
+    fileKind: '一铺一价核算表',
+    projectName: model.project?.name || result.summary?.projectName || '商业地产项目',
+    note: '本表用于复核当前测算口径；人工修改后需重新导入系统，Excel 修改不会自动同步到云端。',
+  });
+}
+
+function shopTemplate() {
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '项目信息', [
+    ['商业地产项目信息'],
+    ['只需填写“填写值”列；未填写的内容可在网页向导中补充。'],
+    ['参数', '填写值', '说明'],
+    ['项目名称', '', '项目正式名称'],
+    ['项目位置', '广西壮族自治区', '省/市/城区，例如：广西壮族自治区柳州市'],
+    ['项目开发状态', '新建项目', '新建项目/旧改项目/运营中项目/轻资产运营项目'],
+    ['商业项目形态', '购物中心', '购物中心/街区商业/社区商业/社区底商等'],
+    ['商户租金核算面积口径', '实用面积（套内/租赁面积）', '向商户出租时的默认计租口径；可填写实用面积（套内/租赁面积）或建筑面积，商铺明细可逐铺覆盖'],
+    ['业主租金支付面积口径', '建筑面积', '向业主支付物业租金时使用，和商户计租口径相互独立'],
+    ['首年物业管理费单价（元/㎡/月）', 18, '物业管理服务费，默认适用于全部铺位'],
+    ['首年商业管理费单价（元/㎡/月）', 0, '商业运营管理服务费，如项目不收可填0'],
+    ['默认中央空调使用费单价（元/㎡/月）', 0, '作为楼栋收费配置的参考单价；实际是否收取在“楼栋收费设置”表开启'],
+    ['项目立项 / 进场日期', '', 'YYYY-MM-DD，用于启动资金和时间轴'],
+    ['建设开工日期', '', 'YYYY-MM-DD'],
+    ['计划竣工日期', '', 'YYYY-MM-DD'],
+    ['项目接管 / 进场日期', '', 'YYYY-MM-DD'],
+    ['招商启动日期', '', 'YYYY-MM-DD'],
+    ['计划开业日期', '', 'YYYY-MM-DD'],
+    ['招商运营年限', 20, '年；可填1–50年'],
+    ['起始年份', 2027, '建设第1年'],
+    ['建设期核算方式', '按年', '按年/按月；填写“按月”时优先读取建设期（按月）'],
+    ['建设期（按年）', 2, '年；填写竣工日期时以日期为准'],
+    ['建设期（按月）', 24, '月；填写竣工日期时以日期为准'],
+    ['总建筑面积', '', '㎡；可留空，由商铺建筑面积反推'],
+    ['占地面积', '', '㎡；用于城镇土地使用税'],
+    ['土地价款', '', '万元'],
+    ['其他前期费用', '', '万元'],
+    ['筹备期营销费用', '', '万元'],
+  ], [24, 32, 44]);
+  addSheet(wb, '楼栋收费设置', [
+    ['楼栋中央空调收费设置'],
+    ['只对实际提供中央空调并向租户收费的楼栋填写“是”；不收取的楼栋填“否”，单价填0。物业费和商业管理费按项目信息表录入单价全项目统一执行。'],
+    [],
+    ['楼栋', '是否收取中央空调费', '中央空调费单价（元/㎡/月）', '说明'],
+    ['1号楼', '否', 0, '示例行，请按项目实际情况修改；填写“是”并填单价后该楼栋才计收空调费'],
+    ['2号楼', '否', 0, '示例行，可删除'],
+  ], [18, 26, 30, 68]);
+  const rows = [
+    ['商铺明细导入表'],
+    ['填写顺序：楼栋 → 楼层 → 铺位号 → 建筑面积 → 实用面积 → 商铺计租例外（可选）→ 租金单价。面积保留两位小数；请从第5行开始录入，不要移动表头。计租例外留空或填“继承上级口径”时，自动跟随楼层/项目计租口径。'],
+    [],
+    ['楼栋', '楼层', '铺位号', '建筑面积（㎡）', '实用面积/套内面积（㎡）', '商铺计租例外（可选）', '业态', '状态', '租金单价（元/㎡/月）', '铺位条件', '备注'],
+    ['1号楼', '1F', 'A-101', 120.00, 90.00, '继承上级口径', '零售', '营业', '', '电梯口、转角铺', '示例行，可删除'],
+  ];
+  const shopWs = addSheet(wb, '商铺明细', rows, [14, 10, 16, 18, 22, 20, 16, 12, 24, 24, 28]);
+  setSheetColumnNumberFormat(shopWs, [3, 4, 8], '0.00');
+  addSheet(wb, '楼栋楼层填写说明', [
+    ['楼栋与楼层填写规范'],
+    ['推荐写法', '说明'],
+    ['1号楼', '楼栋名称。也可填写“1栋”“A栋”“商业中心主楼”等，系统会按原文保留。'],
+    ['B1 / 1F / 2F / 3F', '楼层推荐统一写成地下B1、地上1F、2F。也可填写“负一层”“一楼”“2层”，导入时会自动标准化。'],
+    ['1号楼1F', '如果只在一个单元格内填写楼栋和楼层，系统会尝试自动拆分。'],
+    ['商铺计租例外', '一般留空或填“继承上级口径”；只有该铺确实不跟随楼层/项目计租口径时，才填建筑面积或实用面积。'],
+    ['租金单价', '可直接填写“租金单价”“月租金单价”“合同租金单价”“保底租金”等表头。系统按元/㎡/月识别；元/㎡/天自动×30.4，元/㎡/年自动÷12，并自动计算铺位和楼层收入。'],
+    ['物业管理费', '在项目信息表中填写唯一执行单价，所有铺位统一按该值核算。'],
+    ['商业管理费', '在项目信息表中填写唯一执行单价，所有铺位统一按该值核算。'],
+    ['中央空调费', '先在“楼栋收费设置”表选择楼栋“是”并填写楼栋单价；楼栋关闭时不收取。'],
+    ['面积精度', '建筑面积、实用面积及三项收费单价自动四舍五入保留两位小数。'],
+    [''], ['楼栋楼层示例字典'],
+    ['楼栋', '楼层'],
+    ['1号楼', 'B1'], ['1号楼', '1F'], ['1号楼', '2F'], ['1号楼', '3F'],
+    ['2号楼', 'B1'], ['2号楼', '1F'], ['2号楼', '2F'],
+  ], [22, 78]);
+  return formatWorkbook(wb, {
+    profile: 'template',
+    title: '铺位与一铺一价导入模板',
+    subtitle: '项目信息、楼栋空调收费、逐铺面积与租金一次录入',
+    fileKind: '导入模板',
+    projectName: '商业地产项目铺位导入',
+    inputSheets: ['项目信息', '楼栋收费设置', '商铺明细'],
+  });
+}
+
+function marketTemplate() {
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '竞品租金样本', [
+    ['竞品租金调研导入表'],
+    ['建议填写3–5公里内的同类商业项目；月租金单位：元/㎡/月。'],
+    [],
+    ['样本名称', '地址', '楼层', '业态', '可租赁面积（㎡）', '月租金单价（元/㎡/月）', '数据日期', '距项目（km）', '备注'],
+    ['示例购物中心', '柳州市城中区', '1F', '零售', 120, 138, '2026-09', 1.8, '示例行，可删除'],
+  ], [24, 32, 10, 16, 18, 22, 14, 14, 28]);
+  return formatWorkbook(wb, {
+    profile: 'template',
+    title: '3–5公里竞品租金调研模板',
+    subtitle: '竞品项目、楼层、业态、可租赁面积与月租金样本',
+    fileKind: '调研导入模板',
+    projectName: '竞品租金市场调研',
+    inputSheets: ['竞品租金样本'],
+  });
+}
+
+
+const EXPORT_FUNCTIONS = {
+  'IF': { syntax: 'IF(条件,成立值,不成立值)', meaning: '条件判断，根据条件选择不同计算路径。', example: 'IF(运营年=1,首年最低出租率,稳定期出租率)', note: '调整出租率、计租方式、退出方法和还款方式时重点检查。' },
+  'SUM': { syntax: 'SUM(数值1,数值2,…)', meaning: '汇总多个分项金额。', example: '项目总投资=SUM(土地,工程,装修,预备费,开办费,流动资金)', note: '新增费用时确认是否已纳入汇总。' },
+  'MAX': { syntax: 'MAX(数值1,数值2,…)', meaning: '取最大值，用于保底取高和零值下限。', example: 'MAX(保底租金,联营扣点)', note: '取高模式不会重复计算保底与扣点。' },
+  'MIN': { syntax: 'MIN(数值1,数值2,…)', meaning: '取最小值，用于抵扣上限和溢价封顶。', example: 'MIN(销项税,可抵扣进项税)', note: '上限设置应依据税法和招商政策。' },
+  'POWER': { syntax: 'POWER(底数,指数)', meaning: '乘幂，用于复利增长和折现。', example: '(1+租金增长率)^运营年', note: '复利前低后高，固定递增额应改用单利或按租约录入。' },
+  'INT': { syntax: 'INT(数值)', meaning: '向下取整，用于计算完整递增周期。', example: 'INT((运营年-1)÷递增周期)', note: '每N年阶梯递增时，未满一个完整周期不得提前上调。' },
+  'ROUND': { syntax: 'ROUND(数值,小数位)', meaning: '按小数位四舍五入。', example: 'ROUND(总投资,2)', note: '底层计算保留原精度，展示时取整。' },
+  'NPV': { syntax: 'Σ[CFt÷(1+r)^t]', meaning: '净现值，将未来现金流按折现率折现后相加。', example: 'NPV=CF1/(1+r)+CF2/(1+r)^2+…', note: 'NPV大于0表示达到或超过门槛收益。' },
+  'IRR': { syntax: 'NPV(IRR)=0', meaning: '内部收益率，项目自身可承受的折现率。', example: 'IRR=10%，门槛8%，则超过门槛2个百分点', note: '现金流结构异常时可能无解，应同时看NPV。' },
+  'MOD': { syntax: 'MOD(数值,除数)', meaning: '取余数，用于判断续租周期等周期性年份。', example: 'MOD(运营年,续租周期)=0', note: '续租佣金不能每年重复计算。' },
+  'INDEX': { syntax: 'INDEX(列表,位置)', meaning: '按位置取列表值。', example: 'INDEX(年度租金,运营年)', note: '确保年份和楼层数据完整。' },
+  'LOOKUP': { syntax: 'LOOKUP(查找值,区域,返回区域)', meaning: '按条件查找并返回对应数据。', example: '查找回收期对应年度', note: '查找区域应覆盖完整测算期。' },
+  'SEQUENCE': { syntax: 'SEQUENCE(MIN,MAX,STEP)', meaning: '按上下限和步长生成情景序列。', example: '90%、95%、100%、105%、110%', note: '通常5个情景即可，步长过细会增加计算量。' },
+  '二分法': { syntax: '反复取区间中点逼近NPV=0', meaning: '数值求解IRR或盈亏平衡点的方法。', example: '在-99.99%到1000%之间迭代求解', note: '无解时系统显示“不适用”。' },
+};
+
+function exportFunctionDescription(names) {
+  return (names || []).map(name => {
+    const f = EXPORT_FUNCTIONS[name];
+    return f ? `${name}：${f.syntax}；${f.meaning}` : name;
+  }).join(' / ');
+}
+
+
+const BUDGET_BASIC_DEFS = [
+  { label: '单位社保公积金综合比例', path: 'organization.socialInsuranceRate', unit: '%', scale: 0.01, value: 28, aliases: ['社保公积金综合比例'], description: '单位承担的养老、医疗、失业、工伤、生育及公积金综合比例；默认值仅为测算参考' },
+  { label: '个人社保公积金比例', path: 'organization.employeeSocialInsuranceRate', unit: '%', scale: 0.01, value: 10.5, aliases: ['个人社保公积金综合比例'], description: '从员工税前工资中代扣的个人社保及公积金综合比例' },
+  { label: '个税起征点', path: 'organization.individualIncomeTaxThresholdMonthly', unit: '元/月', scale: 1, value: 5000, aliases: ['基本减除费用'], description: '居民个人综合所得基本减除费用，通常为5000元/月，以适用税法为准' },
+  { label: '专项附加扣除', path: 'organization.specialAdditionalDeductionMonthly', unit: '元/人/月', scale: 1, value: 0, description: '子女教育、住房贷款/租金、赡养老人等平均月扣除额' },
+  { label: '年度薪资月数（如12/15薪）', path: 'organization.annualSalaryMonths', unit: '薪/年', scale: 1, value: 12, aliases: ['年度薪资月数', '年终奖月数'], description: '影响税前年度工资和应税所得；不增加社保公积金12个月的缴费次数' },
+  { label: '招聘培训费率', path: 'organization.recruitmentTrainingRate', unit: '%', scale: 0.01, value: 2, description: '按企业人员成本计取的招聘、培训及团队建设费用' },
+  { label: '人员成本来源', path: 'operations.staffCostMode', unit: '', scale: 1, value: '按组织架构薪资倒推' },
+  { label: '物业基础运营单价', path: 'operations.propertyOpsCost', unit: '元/㎡/月', scale: 1, value: 10 },
+  { label: '公共能耗单价', path: 'operations.energyCost', unit: '元/㎡/月', scale: 1, value: 4.5 },
+  { label: '日常维修费率', path: 'operations.repairRate', unit: '%', scale: 0.01, value: 1 },
+  { label: '保险费用率', path: 'operations.insuranceRate', unit: '%', scale: 0.01, value: 0.15 },
+  { label: '其他运营费用率', path: 'operations.otherOpexRate', unit: '%', scale: 0.01, value: 0.5 },
+  { label: '物业基础运营直接金额', path: 'operations.annualCostOverrides.propertyOps', unit: '万元/年', scale: 1, value: 0 },
+  { label: '公共能耗直接金额', path: 'operations.annualCostOverrides.energy', unit: '万元/年', scale: 1, value: 0 },
+  { label: '日常维修直接金额', path: 'operations.annualCostOverrides.baseMaintenance', unit: '万元/年', scale: 1, value: 0 },
+  { label: '保险费用直接金额', path: 'operations.annualCostOverrides.insurance', unit: '万元/年', scale: 1, value: 0 },
+  { label: '其他运营费用直接金额', path: 'operations.annualCostOverrides.otherOpex', unit: '万元/年', scale: 1, value: 0 },
+];
+const CHINA_IIT_ANNUAL_BRACKETS = [
+  ['不超过 36,000', '3%', 0],
+  ['36,000 – 144,000', '10%', 2520],
+  ['144,000 – 300,000', '20%', 16920],
+  ['300,000 – 420,000', '25%', 31920],
+  ['420,000 – 660,000', '30%', 52920],
+  ['660,000 – 960,000', '35%', 85920],
+  ['超过 960,000', '45%', 181920],
+];
+const OFFICE_BUDGET_DEFS = [
+  ['办公室租金', 'officeRentAnnual'], ['水电及通讯费', 'utilitiesAnnual'], ['IT及软件服务', 'itSoftwareAnnual'],
+  ['办公用品', 'officeSuppliesAnnual'], ['差旅及业务招待', 'travelEntertainmentAnnual'], ['其他办公费用', 'otherAnnual'],
+];
+const LEASING_BUDGET_DEFS = [
+  ['渠道及代理费', 'channelFeeAnnual'], ['招商活动', 'eventsAnnual'], ['招商物料', 'materialsAnnual'],
+  ['招商差旅', 'travelAnnual'], ['招商平台及系统', 'platformAnnual'], ['其他招商费用', 'otherAnnual'],
+];
+const MAINTENANCE_BUDGET_DEFS = [
+  ['电梯维保', 'elevatorAnnual'], ['暖通空调维保', 'hvacAnnual'], ['消防维保', 'fireAnnual'],
+  ['景观绿化养护', 'landscapeAnnual'], ['其他专项维保', 'otherAnnual'],
+];
+const PREOPENING_DEFS = [
+  { label: '首开招商佣金月数', path: 'operations.commissionMonths', unit: '月', scale: 1, value: 1 },
+  { label: '筹备招商总周期', path: 'project.leasingPeriodMonths', unit: '月', scale: 1, value: 12 },
+  { label: '启动资金安全垫', path: 'project.startupReserveMonths', unit: '月', scale: 1, value: 3 },
+  { label: '筹备期团队成本', path: 'project.preOpeningTeamCost', unit: '万元', scale: 1, value: 0 },
+  { label: '筹备期物业成本', path: 'project.preOpeningPropertyCost', unit: '万元', scale: 1, value: 0 },
+  { label: '筹备期营销费用', path: 'project.preOpeningMarketing', unit: '万元', scale: 1, value: 0 },
+  { label: '其他前期及开办费用', path: 'project.otherPreOpening', unit: '万元', scale: 1, value: 0 },
+];
+const MARKETING_ANNUAL_DEFS = [
+  ['营销推广', 'promotion'], ['商业美陈', 'visual'], ['媒体宣传', 'media'], ['会员营销', 'member'],
+];
+const MARKETING_OPENING_DEFS = [
+  ['导视导览', 'wayfinding'], ['开业美陈', 'opening_visual'],
+];
+const PROPERTY_SERVICE_DEFS = [
+  { key: 'property', name: '物业工程服务', note: '物业经理、工程、消防、强弱电、暖通、机电等岗位' },
+  { key: 'security', name: '保安服务', note: '保安、秩序维护、监控等岗位' },
+  { key: 'cleaning', name: '保洁服务', note: '保洁、环境卫生、垃圾清运等岗位' },
+];
+const PROPERTY_SERVICE_MODE_LABELS = {
+  self: '自营（自行招聘）',
+  resident_outsourced: '第三方常驻外包',
+  non_resident: '第三方非常驻服务',
+};
+
+function modelValueAtPath(model, path, fallback = '') {
+  let value = model;
+  for (const key of String(path || '').split('.')) {
+    if (value === null || value === undefined || typeof value !== 'object') return fallback;
+    value = value[key];
+  }
+  return value === null || value === undefined ? fallback : value;
+}
+
+function exportCurrentPreopeningBudget(result) {
+  const model = result.model || {};
+  const project = model.project || {};
+  const budget = model.preOpeningBudget || {};
+  const team = budget.team || {};
+  const property = budget.property || {};
+  const admin = budget.admin || {};
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '使用说明', [
+    ['筹备期成本当前数据'],
+    ['本文件导出当前项目已经录入的筹备团队、物业服务、物业一次性费用和行政开办明细，可用于线下复核或回传导入。'],
+    ['金额单位：团队工资为元/月，物业岗位工资为元/月，物业一次性费用为万元，行政开办金额按“金额口径”列执行。'],
+  ], [24, 110]);
+  addSheet(wb, '基础参数', [
+    ['参数', '当前值', '说明'],
+    ['单位社保公积金综合比例（%）', Number(team.socialInsuranceRate || 0) * 100, '按当前项目组织架构口径'],
+    ['招聘培训费率（%）', Number(team.recruitmentTrainingRate || 0) * 100, '按筹备团队工资与单位社保计提'],
+    ['自营物业招聘培训费率（%）', Number(property.selfRecruitmentRate || 0) * 100, '用于自营物业岗位'],
+    ['筹备招商总周期（月）', Number(project.leasingPeriodMonths || 0), '当前项目筹备招商周期'],
+  ], [34, 16, 72]);
+  addSheet(wb, '筹备团队', [
+    ['部门', '岗位', '编制人数', '税前月薪（元/月）', '筹备月数', '岗位职责/说明'],
+    ...(team.positions || []).map(item => [item.department, item.position, Number(item.headcount || 0), Number(item.monthlySalary || 0), Number(item.months || 0), item.note || '']),
+  ], [18, 22, 14, 24, 14, 60]);
+  const propertyRows = [];
+  const propertyServiceRows = [];
+  (property.services || []).forEach(service => {
+    const positions = Array.isArray(service.positions) && service.positions.length ? service.positions : [{ name: service.name || '物业岗位', headcount: service.headcount || 0, monthlySalary: service.monthlySalary || 0, note: '' }];
+    const headcount = positions.reduce((sum, position) => sum + Number(position.headcount || 0), 0);
+    const weightedSalary = headcount > 0 ? positions.reduce((sum, position) => sum + Number(position.headcount || 0) * Number(position.monthlySalary || 0), 0) / headcount : Number(service.monthlySalary || 0);
+    propertyServiceRows.push([service.name || '', propertyLabel(service.mode), headcount, weightedSalary, Number(service.months || 0), Number(service.nonResidentFactor ?? 0.7) * 100, Number(service.managementFeeRate || 0) * 100, '']);
+    positions.forEach(position => propertyRows.push([service.name || '', position.name || '', Number(position.headcount || 0), Number(position.monthlySalary || 0), position.note || '']));
+  });
+  addSheet(wb, '物业服务', [
+    ['服务类别', '服务模式', '编制人数', '参考月薪（元/月）', '服务月数', '非驻场折算比例（%）', '综合管理费率（%）', '说明'],
+    ...propertyServiceRows,
+  ], [18, 26, 14, 24, 14, 24, 24, 56]);
+  addSheet(wb, '物业服务岗位', [
+    ['服务类别', '岗位名称', '编制人数', '参考月薪（元/月）', '岗位说明'],
+    ...propertyRows,
+  ], [18, 22, 14, 24, 62]);
+  addSheet(wb, '物业一次性费用', [
+    ['费用项目', '金额（万元）', '说明'],
+    ...(property.oneOffItems || []).map(item => [item.name || '', Number(item.amount || 0), item.note || '']),
+  ], [24, 18, 72]);
+  addSheet(wb, '行政开办', [
+    ['费用科目', '金额（元）', '金额口径', '月数', '说明'],
+    ...(admin.items || []).map(item => [item.name || '', Number(item.amount || 0), item.period === 'monthly' ? '每月' : '一次性总额', Number(item.months || 0), item.note || '']),
+  ], [26, 18, 18, 14, 72]);
+  return formatWorkbook(wb, {
+    profile: 'report',
+    title: '筹备期成本当前明细',
+    subtitle: '用于线下复核、合作方调整和回传导入',
+    fileKind: '筹备期成本导出',
+    projectName: project.name || '商业地产项目',
+  });
+}
+
+function propertyLabel(mode) {
+  return PROPERTY_SERVICE_MODE_LABELS[String(mode || 'self')] || PROPERTY_SERVICE_MODE_LABELS.self;
+}
+
+function exportCurrentOperatingBudget(result) {
+  const model = result.model || {};
+  const project = model.project || {};
+  const organization = model.organization || {};
+  const propertyService = model.propertyService || {};
+  const officeBudget = model.officeBudget || {};
+  const leasingBudget = model.leasingBudget || {};
+  const marketingBudget = model.marketingBudget || {};
+  const maintenanceBudget = model.maintenanceBudget || {};
+  const operations = model.operations || {};
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '使用说明', [
+    ['运营成本当前数据'],
+    ['本文件导出当前项目已录入的组织架构、物业服务模式、办公预算、招商预算、租赁收款条款、营销预算和维保预算。'],
+    ['可用于线下复核和伙伴调整；导入系统时请保持工作表和表头名称不变。'],
+  ], [24, 110]);
+  addSheet(wb, '基础参数', [
+    ['参数', '当前值', '单位', '说明'],
+    ...BUDGET_BASIC_DEFS.map(item => [item.label, modelValueAtPath(model, item.path, item.value), item.unit, item.description || '']),
+  ], [32, 18, 16, 62]);
+  const orgRows = [];
+  (organization.departments || []).forEach(department => {
+    (department.positions || []).forEach(position => orgRows.push([department.name || '', position.name || '', Number(position.headcount || 0), Number(position.avgMonthlySalary || position.monthlySalary || 0), position.note || '']));
+  });
+  addSheet(wb, '组织架构', [
+    ['部门', '岗位', '编制人数', '税前应发月薪（元/月）', '岗位职责说明'],
+    ...orgRows,
+  ], [20, 24, 14, 26, 64]);
+  addSheet(wb, '物业服务模式', [
+    ['服务类别', '服务模式', '非驻场折算比例（%）', '综合管理费率（%）', '说明'],
+    ...PROPERTY_SERVICE_DEFS.map(item => {
+      const config = propertyService[item.key] || {};
+      return [item.name, propertyLabel(config.mode), Number(config.nonResidentFactor ?? 0.7) * 100, Number(config.managementFeeRate || 0) * 100, item.note];
+    }),
+  ], [24, 26, 26, 24, 60]);
+  addSheet(wb, '办公预算', [
+    ['费用项目', '录入金额（元/期）', '录入周期', '说明'],
+    ...(officeBudget.items || []).map(item => [item.name || '', Number(item.annual || 0), item.period === 'monthly' ? '按月' : '按年', item.note || '']),
+  ], [26, 22, 16, 60]);
+  addSheet(wb, '招商预算', [
+    ['费用项目', '年度金额（万元）', '说明'],
+    ['渠道及代理费', Number(leasingBudget.channelFeeAnnual || 0), '按招商渠道及代理合同'],
+    ['招商活动', Number(leasingBudget.eventsAnnual || 0), ''],
+    ['招商物料', Number(leasingBudget.materialsAnnual || 0), ''],
+    ['招商差旅', Number(leasingBudget.travelAnnual || 0), ''],
+    ['招商平台及系统', Number(leasingBudget.platformAnnual || 0), ''],
+    ['其他招商费用', Number(leasingBudget.otherAnnual || 0), ''],
+  ], [24, 20, 70]);
+  addSheet(wb, '招商渠道核算', [
+    ['参数', '当前值', '单位', '说明'],
+    ['渠道费核算方式', leasingBudget.channelCalculationMode === 'area_rent' ? '按面积及首年月租金' : '按金额', '', ''],
+    ['渠道招商面积比例（%）', Number(leasingBudget.channelAreaRatio || 0) * 100, '%', ''],
+    ['渠道首年月租金单价（元/㎡/月）', Number(leasingBudget.channelRentPerSqmMonth || 0), '元/㎡/月', ''],
+    ['佣金月数', Number(leasingBudget.channelCommissionMonths || 0), '月', ''],
+  ], [32, 20, 18, 62]);
+  addSheet(wb, '营销常规预算', [
+    ['营销类别', '年度金额（万元）', '费用内容'],
+    ...(marketingBudget.annualItems || []).map(item => [item.name || '', Number(item.amount || 0), item.note || '']),
+  ], [24, 20, 70]);
+  addSheet(wb, '开业首年营销', [
+    ['开业专项', '首年金额（万元）', '费用内容'],
+    ...(marketingBudget.openingYearItems || []).map(item => [item.name || '', Number(item.amount || 0), item.note || '']),
+  ], [24, 20, 70]);
+  addSheet(wb, '招商调整阶段', [
+    ['阶段名称', '起始运营年', '结束运营年', '租金调整率（%）', '目标出租率（%）', '一次性招商成本（万元）', '说明'],
+    ...(operations.leasingAdjustmentPeriods || []).map(item => [item.name || '', Number(item.startYear || 0), Number(item.endYear || 0), Number(item.rentAdjustmentRate || 0) * 100, Number(item.targetOccupancy || 0) * 100, Number(item.oneOffLeasingCost || 0), item.note || '']),
+  ], [24, 14, 14, 18, 18, 24, 60]);
+  addSheet(wb, '租赁收款条款', [
+    ['参数', '当前值', '单位', '说明'],
+    ['租金收取方式', operations.rentCollectionMode === 'deposit_only' ? '仅收押金' : operations.rentCollectionMode === 'prepaid_only' ? '仅收预付租金' : '押金+预付租金', '', '招商签约时按已租铺位收取'],
+    ['租赁保证金月数', Number(operations.depositMonths || 0), '月', '保证金按已租铺位月租金乘月数收取，期末退还'],
+    ['预付租金月数', Number(operations.prepaidRentMonths || 0), '月', '预付租金在签约时收取，后续月份不重复计入'],
+  ], [26, 22, 16, 100]);
+  addSheet(wb, '维保预算', [
+    ['维保项目', '年度金额（万元）'],
+    ['电梯维保', Number(maintenanceBudget.elevatorAnnual || 0)],
+    ['暖通空调维保', Number(maintenanceBudget.hvacAnnual || 0)],
+    ['消防维保', Number(maintenanceBudget.fireAnnual || 0)],
+    ['景观绿化养护', Number(maintenanceBudget.landscapeAnnual || 0)],
+    ['其他专项维保', Number(maintenanceBudget.otherAnnual || 0)],
+  ], [28, 22]);
+  return formatWorkbook(wb, {
+    profile: 'report',
+    title: '运营成本当前预算',
+    subtitle: '组织架构、物业服务、办公招商、营销和维保预算',
+    fileKind: '运营预算导出',
+    projectName: project.name || '商业地产项目',
+  });
+}
+
+function operatingBudgetTemplate() {
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '使用说明', [
+    ['多多 · 商业地产运营成本预算导入模板'],
+    ['请在黄色或空白单元格中填写，不要修改工作表名称和表头。'],
+    ['导入后会覆盖当前项目的组织架构、办公、招商、租赁收款条款、招商调整阶段、营销和维保预算；不填写的工作表保持原值。'],
+    ['费用优先按金额填写，权重和占比由系统自动计算，无需手工凑100%。办公预算按“元/期”填写；招商、营销和维保按“万元/年”填写；工资单位为元/月。'],
+    ['办公预算和招商预算可按年或按月录入：按年录入时系统自动÷12得到月均；按月录入时自动×12得到年度金额。'],
+    ['组织架构中的“税前应发基本月薪”是员工税前工资，不是实发工资。系统会继续计算个人社保公积金、个人所得税、实发工资、单位社保公积金和企业人员成本。'],
+    ['社保公积金比例、个税起征点和专项附加扣除必须按项目属地最新政策及员工实际情况调整；模板默认值仅为测算示例。'],
+    ['物业服务模式表可分别设置物业工程、保安、保洁为自营、第三方常驻外包或第三方非常驻服务；三种模式均以岗位成本为基础，第三方模式另计综合管理费。'],
+    ['物业服务岗位表用于分别录入物业工程、保安、保洁下的岗位、编制人数和参考月薪；物业服务表负责设置服务模式和折算费率。'],
+    ['招商调整阶段表用于设置运营期内的品牌升级、业态优化或换租阶段；填写阶段名称即启用，起止年不要重叠。'],
+  ], [20, 100]);
+  addSheet(wb, '基础参数', [
+    ['参数', '填写值', '单位', '说明'],
+    ...BUDGET_BASIC_DEFS.map(item => [item.label, item.value, item.unit, item.description || '按项目实际预算和属地政策填写']),
+  ], [28, 18, 16, 56]);
+  const orgWs = addSheet(wb, '组织架构', [
+    ['部门', '岗位', '编制人数', '税前应发月薪（元/月）', '岗位职责说明'],
+    ['总经办', '项目总经理', 1, 25000, '项目整体经营、投资与重大决策'],
+    ['总经办', '综合管理经理', 1, 14000, '计划运营、制度流程与跨部门协调'],
+    ['招商部', '招商总监', 1, 20000, '招商策略、主力店及重点品牌'],
+    ['招商部', '招商经理', 2, 13000, '业态招商、品牌储备与商务谈判'],
+    ['招商部', '租赁专员', 3, 8500, '客户拓展、带看、合同及台账'],
+    ['运营部', '运营总监', 1, 18000, '经营目标、营运统筹与重大事项'],
+    ['运营部', '运营经理', 2, 12000, '楼层经营、租户管理与经营分析'],
+    ['运营部', '楼层主管', 3, 9000, '现场巡检、租户服务和问题处理'],
+    ['运营部', '客服专员', 4, 6500, '服务台、投诉、会员及活动支持'],
+    ['市场推广部', '市场总监', 1, 18000, '市场策略、预算和品牌统筹'],
+    ['市场推广部', '品牌经理', 1, 11000, '品牌传播、公关和异业合作'],
+    ['市场推广部', '新媒体专员', 1, 8000, '内容、短视频和线上平台'],
+    ['市场推广部', '会员运营', 1, 8000, '会员体系、私域和会员活动'],
+    ['财务行政部', '财务经理', 1, 13000, '预算、核算、税务和资金管理'],
+    ['财务行政部', '会计', 1, 9000, '账务、报表、结算和发票'],
+    ['财务行政部', '人事行政专员', 1, 8000, '招聘、薪酬、行政和采购'],
+    ['物业工程部', '物业经理', 1, 13000, '物业统筹、供应商和品质管理'],
+    ['物业工程部', '工程主管', 2, 9000, '机电、暖通、给排水和维修'],
+    ['物业工程部', '消防及强弱电', 3, 7000, '消防、弱电、配电及设备巡检'],
+    ['保安部', '保安主管', 1, 7000, '秩序维护、排班和应急管理'],
+    ['保安部', '保安员', 7, 5000, '门岗、巡逻、监控和车辆管理'],
+    ['保洁部', '保洁主管', 1, 6000, '保洁品质、排班和物料管理'],
+    ['保洁部', '保洁员', 9, 4000, '公共区域、卫生间和垃圾清运'],
+  ], [18, 20, 14, 26, 52]);
+  setSheetColumnNumberFormat(orgWs, [3], '0.00');
+  addSheet(wb, '薪酬口径说明', [
+    ['薪酬核算口径与公式说明'],
+    ['项目', '公式 / 说明'],
+    ['输入口径', '岗位月薪填写税前应发基本月薪，不填写员工实发工资，也不填写企业总成本。'],
+    ['税前年度工资', 'Σ(岗位编制人数 × 税前应发月薪 × 年度薪资月数)。年度薪资月数可为12、13、14、15薪。'],
+    ['个人社保公积金', 'Σ(税前应发月薪 × 12 × 个人社保公积金比例)。模板按月薪作为月缴费基数、全年缴费12个月。'],
+    ['单位社保公积金', 'Σ(税前应发月薪 × 12 × 单位社保公积金比例)。'],
+    ['年度应纳税所得额', '税前年度工资 - 个人社保公积金 - 个税起征点×12 - 专项附加扣除×12。'],
+    ['个人所得税', '应纳税所得额 × 适用税率 - 速算扣除数；采用中国综合所得七级年度超额累进税率。'],
+    ['实发工资', '税前年度工资 - 个人社保公积金 - 个人所得税。'],
+    ['企业人员成本', '税前年度工资 + 单位社保公积金。'],
+    ['含招聘培训人员成本', '企业人员成本 + 企业人员成本×招聘培训费率。'],
+    ['重要提示', '社保公积金比例、缴费基数上下限、个税专项附加扣除和适用政策因城市、年度、险种及员工情况不同，系统默认值不能替代属地申报口径。'],
+  ], [28, 110]);
+  addSheet(wb, '个税税率表', [
+    ['中国居民个人综合所得年度税率表（测算参考）'],
+    ['年度应纳税所得额（元）', '税率', '速算扣除数（元）'],
+    ...CHINA_IIT_ANNUAL_BRACKETS,
+    [''],
+    ['计算公式', '个人所得税 = 年度应纳税所得额 × 适用税率 - 速算扣除数'],
+    ['年度应纳税所得额', '税前年度工资 - 个人社保公积金 - 个税起征点×12 - 专项附加扣除×12'],
+    ['说明', '系统用于年度投资测算；正式申报应以累计预扣预缴和年度汇算结果为准。'],
+  ], [30, 18, 22]);
+  addSheet(wb, '物业服务模式', [
+    ['服务类别', '服务模式', '非驻场折算比例（%）', '第三方综合管理费率（%）', '说明'],
+    ...PROPERTY_SERVICE_DEFS.map(item => [item.name, PROPERTY_SERVICE_MODE_LABELS.self, 70, 12, `${item.note}。综合管理费率用于第三方模式，自营模式不收取。`]),
+    [''],
+    ['填写说明', '服务模式可填：自营、第三方常驻外包、第三方非常驻服务。', '', '', '非驻场折算比例只在第三方非常驻模式使用；综合管理费率建议包含管理费、利润、保险、装备、培训及税费。'],
+  ], [20, 26, 24, 28, 90]);
+  addSheet(wb, '筹备期成本', [
+    ['参数', '填写值', '单位', '说明'],
+    ...PREOPENING_DEFS.map(item => [item.label, item.value, item.unit, item.path === 'operations.commissionMonths' ? '按满租月租金和首年最低出租率计算首开招商佣金' : '只进入筹备期投资，不重复计入运营期成本']),
+  ], [30, 20, 16, 90]);
+  addSheet(wb, '租赁收款条款', [
+    ['参数', '填写值', '单位', '说明'],
+    ['租金收取方式', '押金+预付租金', '', '可填：押金+预付租金 / 仅收押金 / 仅收预付租金'],
+    ['租赁保证金月数', 3, '月', '按初始已租铺位月租金乘保证金月数，于招商签约时收取'],
+    ['预付租金月数', 3, '月', '按初始已租铺位月租金乘预付月数，于招商签约时收取；后续月份不重复计收'],
+  ], [26, 22, 16, 100]);
+  addSheet(wb, '办公预算', [['费用项目', '录入周期', '录入金额（元/期）', '说明'], ...OFFICE_BUDGET_DEFS.map(([label]) => [label, '按年', 0, ''])] , [26, 16, 22, 50]);
+  addSheet(wb, '招商预算', [['费用项目', '录入周期', '录入金额（万元/期）', '说明'], ...LEASING_BUDGET_DEFS.map(([label]) => [label, '按年', 0, ''])] , [26, 16, 22, 50]);
+  addSheet(wb, '招商渠道核算', [
+    ['参数', '填写值', '单位', '说明'],
+    ['渠道及代理费核算方式', '按金额', '', '可填“按金额”或“按渠道面积和首年月租金”'],
+    ['渠道招商面积比例', 50, '%', '按项目总建筑面积计算渠道招商面积，例如2,000㎡×50%=1,000㎡'],
+    ['首年月租金单价', 0, '元/㎡/月', '留0自动采用项目平均月租金；可改为人工测算或合同约定单价'],
+    ['首年月租金倍数', 1, '个月', '1表示1个月租金，1.5表示1.5个月租金'],
+    ['说明', '渠道及代理费=项目总建筑面积×渠道面积比例×首年月租金单价×月租金倍数÷10000', '', '页面默认带出项目均价并允许人工调整；首开招商佣金已在项目投资中单列，如为同一笔合同请勿重复计入。'],
+  ], [30, 24, 18, 100]);
+  addSheet(wb, '招商调整阶段', [
+    ['阶段名称', '起始运营年', '结束运营年', '租金调整幅度（%）', '目标出租率（%）', '一次性招商成本（万元）', '调整说明'],
+    ['', 4, 6, 5, 94, 0, '如需启用，请填写阶段名称；租金调整幅度正数上调、负数下调，填0表示沿用原出租率'],
+  ], [24, 16, 16, 22, 20, 26, 78]);
+  addSheet(wb, '营销常规预算', [
+    ['营销类别', '年度金额（万元）', '费用内容'],
+    ['营销推广', 80, '节庆活动、主题推广、异业合作及日常营销执行'],
+    ['商业美陈', 50, '公共区域美陈、季节装饰、陈列更新'],
+    ['媒体宣传', 40, '线上信息流、户外媒体、本地生活平台及公关传播'],
+    ['会员营销', 30, '会员权益、积分、小程序、私域运营及会员活动'],
+  ], [24, 16, 60]);
+  addSheet(wb, '开业首年营销', [
+    ['开业专项', '首年金额（万元）', '费用内容'],
+    ['导视导览', 20, '开业导视、导览标识及临时指引'],
+    ['开业美陈', 40, '开业主题美陈、氛围布置及公共空间装饰'],
+  ], [24, 16, 60]);
+  addSheet(wb, '维保预算', [['维保项目', '年度金额（万元）', '说明'], ...MAINTENANCE_BUDGET_DEFS.map(([label]) => [label, 0, ''])] , [26, 20, 50]);
+  return formatWorkbook(wb, {
+    profile: 'template',
+    title: '运营成本与人员预算导入模板',
+    subtitle: '组织架构、物业服务、办公招商、营销和维保预算',
+    fileKind: '运营预算模板',
+    projectName: '商业地产运营成本预算',
+    inputSheets: ['基础参数', '组织架构', '物业服务模式', '筹备期成本', '办公预算', '招商预算', '招商渠道核算', '招商调整阶段', '营销常规预算', '开业首年营销', '维保预算'],
+  });
+}
+
+function preopeningBudgetTemplate() {
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '使用说明', [
+    ['多多 · 商业地产筹备期成本明细导入模板'],
+    ['适用于开业前筹备团队、物业工程/保安/保洁、行政办公及开办费用明细。'],
+    ['请勿修改工作表名称和表头。黄色空白区域可填写，金额单位按各表表头执行。'],
+    ['筹备团队月薪为税前月薪；系统按筹备月数计算税前工资、单位社保和招聘培训。'],
+    ['物业工程、保安、保洁可分别选择自营、第三方常驻外包或第三方非常驻服务；第三方模式另计综合管理费。'],
+    ['行政开办费用可按“每月×月数”或“一次性总额”录入。'],
+    ['导入后会自动切换为“明细预算”，并将团队、物业和行政总表金额回写项目总投资。'],
+  ], [22, 110]);
+  addSheet(wb, '基础参数', [
+    ['参数', '填写值', '说明'],
+    ['单位社保公积金综合比例（%）', 28, '单位承担的社保和公积金综合比例，正式申报应按属地政策复核'],
+    ['招聘培训费率（%）', 2, '按筹备团队工资与单位社保合计计提'],
+    ['自营物业招聘培训费率（%）', 2, '用于自营物业工程、保安、保洁岗位'],
+    ['默认筹备月数', 12, '新增岗位或行政月度费用默认继承筹备招商总周期'],
+  ], [32, 18, 72]);
+  addSheet(wb, '筹备团队', [
+    ['部门', '岗位', '编制人数', '税前月薪（元/月）', '筹备月数', '岗位职责/说明'],
+    ['项目筹备组', '筹备负责人', 0, 18000, 12, '填写实际编制人数后计入；0表示不纳入'],
+    ['招商部', '招商经理', 0, 12000, 12, '负责首开招商、品牌储备和商务谈判'],
+    ['运营部', '运营经理', 0, 12000, 12, '负责筹备运营制度、动线和租户进场'],
+    ['市场推广部', '市场推广经理', 0, 10000, 12, '负责开业推广、媒体和美陈'],
+    ['财务行政部', '财务行政专员', 0, 9000, 12, '负责预算、合同、人事和行政'],
+    ['物业工程部', '工程机电主管', 0, 9000, 12, '负责工程介入、机电和物业筹备'],
+  ], [18, 20, 14, 24, 14, 56]);
+  addSheet(wb, '物业服务', [
+    ['服务类别', '服务模式', '编制人数', '参考月薪（元/月）', '服务月数', '非驻场折算比例（%）', '综合管理费率（%）', '说明'],
+    ['物业工程', '自营（自行招聘）', 0, 8000, 12, 70, 12, '工程介入、机电、消防、强弱电等'],
+    ['保安服务', '第三方常驻外包', 0, 5500, 12, 70, 12, '筹备期门岗、巡逻和现场秩序'],
+    ['保洁服务', '第三方常驻外包', 0, 4500, 12, 70, 12, '筹备期日常保洁和开业前开荒配合'],
+  ], [18, 26, 14, 24, 14, 24, 24, 56]);
+  addSheet(wb, '物业服务岗位', [
+    ['服务类别', '岗位名称', '编制人数', '参考月薪（元/月）', '岗位说明'],
+    ['物业工程', '物业经理', 0, 13000, '物业统筹、供应商和品质管理'],
+    ['物业工程', '工程主管', 0, 9000, '机电、暖通、给排水和维修'],
+    ['物业工程', '消防及强弱电', 0, 7000, '消防、弱电、配电及设备巡检'],
+    ['保安服务', '保安主管', 0, 7000, '秩序维护、排班和应急管理'],
+    ['保安服务', '保安员', 0, 5000, '门岗、巡逻、监控和车辆管理'],
+    ['保洁服务', '保洁主管', 0, 6000, '保洁品质、排班和物料管理'],
+    ['保洁服务', '保洁员', 0, 4000, '公共区域、卫生间和垃圾清运'],
+  ], [18, 22, 14, 24, 62]);
+  addSheet(wb, '物业一次性费用', [
+    ['费用项目', '金额（万元）', '说明'],
+    ['工程介入', 0, '工程条件核查、设备接管、施工配合等'],
+    ['开荒保洁', 0, '开业前全面开荒、玻璃幕墙及公共区域清洁'],
+    ['物业顾问', 0, '物业体系、标准、培训和顾问服务'],
+    ['物业开办及物资', 0, '工具、耗材、制服、标识及物业开办物资'],
+  ], [24, 18, 72]);
+  addSheet(wb, '行政开办', [
+    ['费用科目', '金额（元）', '金额口径', '月数', '说明'],
+    ['办公室租金', 0, '每月', 6, '筹备办公室租金'],
+    ['水电及通讯费', 0, '每月', 6, '办公水电、网络和通讯'],
+    ['IT及软件服务', 0, '一次性总额', 0, '系统、软件和IT设备'],
+    ['办公用品及家具', 0, '一次性总额', 0, '办公家具、用品和低值易耗品'],
+    ['招聘及培训费', 0, '一次性总额', 0, '招聘渠道、培训及团队建设'],
+    ['差旅及业务招待', 0, '一次性总额', 0, '筹备差旅和业务招待'],
+    ['证照及专业服务费', 0, '一次性总额', 0, '证照、尽调、咨询、法务和审计'],
+    ['其他前期及开办费用', 0, '一次性总额', 0, '其他无法归类的筹备开办费用'],
+  ], [26, 18, 18, 14, 72]);
+  return formatWorkbook(wb, {
+    profile: 'template',
+    title: '筹备期成本明细导入模板',
+    subtitle: '筹备团队、物业工程、保安保洁、行政与开办费用',
+    fileKind: '筹备期预算模板',
+    projectName: '商业地产筹备期成本',
+    inputSheets: ['基础参数', '筹备团队', '物业服务', '物业服务岗位', '物业一次性费用', '行政开办'],
+  });
+}
+
+function parseServiceMode(value) {
+  const text = String(value || '').trim();
+  if (/非常驻/.test(text)) return 'non_resident';
+  if (/常驻|第三方|外包/.test(text)) return 'resident_outsourced';
+  return 'self';
+}
+
+function parsePreopeningBudgetWorkbook(base64, filename) {
+  if (!/\.(xlsx|xlsm)$/i.test(filename)) throw new Error('筹备期成本明细仅支持 .xlsx 或 .xlsm 多工作表文件');
+  const wb = readWorkbook(base64, filename);
+  const warnings = [];
+  const budget = {
+    mode: 'detailed',
+    monthsVersion: 2,
+    team: { socialInsuranceRate: 0.28, recruitmentTrainingRate: 0.02, positions: [] },
+    property: { selfRecruitmentRate: 0.02, services: [], oneOffItems: [] },
+    admin: { items: [] },
+  };
+  const findSheet = keyword => wb.SheetNames.find(name => name.includes(keyword));
+  const findHeader = (rows, required) => rows.findIndex(row => required.every(text => row.some(cell => String(cell || '').includes(text))));
+  const baseSheet = findSheet('基础参数');
+  if (baseSheet) {
+    const rows = getTemplateRows(wb, baseSheet);
+    for (const row of rows) {
+      const label = String(row?.[0] || '');
+      if (/单位社保公积金/.test(label)) budget.team.socialInsuranceRate = Math.max(0, safeNumber(row?.[1])) / 100;
+      else if (/自营物业招聘培训/.test(label)) budget.property.selfRecruitmentRate = Math.max(0, safeNumber(row?.[1])) / 100;
+      else if (/招聘培训费率/.test(label)) budget.team.recruitmentTrainingRate = Math.max(0, safeNumber(row?.[1])) / 100;
+    }
+  }
+  const teamSheet = findSheet('筹备团队');
+  if (teamSheet) {
+    const rows = getTemplateRows(wb, teamSheet);
+    const headerIdx = findHeader(rows, ['部门', '岗位']);
+    if (headerIdx >= 0) {
+      for (const row of rows.slice(headerIdx + 1)) {
+        const position = String(row?.[1] || '').trim();
+        const headcount = Math.max(0, safeNumber(row?.[2]));
+        if (!position && !headcount) continue;
+        budget.team.positions.push({
+          department: String(row?.[0] || '项目筹备组').trim(),
+          position: position || '未命名岗位',
+          headcount,
+          monthlySalary: Math.max(0, safeNumber(row?.[3])),
+          months: Math.max(0, safeNumber(row?.[4])),
+          note: String(row?.[5] || '').trim(),
+        });
+      }
+    }
+  }
+  const propertySheet = findSheet('物业服务');
+  if (propertySheet) {
+    const rows = getTemplateRows(wb, propertySheet);
+    const headerIdx = findHeader(rows, ['服务类别', '服务模式']);
+    if (headerIdx >= 0) {
+      for (const row of rows.slice(headerIdx + 1)) {
+        const name = String(row?.[0] || '').trim();
+        if (!name) continue;
+        budget.property.services.push({
+          key: /保安/.test(name) ? 'security' : /保洁/.test(name) ? 'cleaning' : 'engineering',
+          name,
+          mode: parseServiceMode(row?.[1]),
+          headcount: Math.max(0, safeNumber(row?.[2])),
+          monthlySalary: Math.max(0, safeNumber(row?.[3])),
+          months: Math.max(0, safeNumber(row?.[4])),
+          nonResidentFactor: Math.max(0, Math.min(100, safeNumber(row?.[5] || 70))) / 100,
+          managementFeeRate: Math.max(0, safeNumber(row?.[6] || 12)) / 100,
+        });
+      }
+    }
+  }
+  const propertyPositionSheet = findSheet('物业服务岗位');
+  const positionsByService = new Map();
+  if (propertyPositionSheet) {
+    const rows = getTemplateRows(wb, propertyPositionSheet);
+    const headerIdx = findHeader(rows, ['服务类别', '岗位名称']);
+    if (headerIdx >= 0) {
+      for (const row of rows.slice(headerIdx + 1)) {
+        const serviceName = String(row?.[0] || '').trim();
+        const positionName = String(row?.[1] || '').trim();
+        if (!serviceName || !positionName) continue;
+        if (!positionsByService.has(serviceName)) positionsByService.set(serviceName, []);
+        positionsByService.get(serviceName).push({
+          name: positionName,
+          headcount: Math.max(0, safeNumber(row?.[2])),
+          monthlySalary: Math.max(0, safeNumber(row?.[3])),
+          note: String(row?.[4] || '').trim(),
+        });
+      }
+    }
+  }
+  budget.property.services.forEach(service => {
+    service.positions = positionsByService.get(service.name) || [{
+      name: `${service.name}岗位`,
+      headcount: service.headcount,
+      monthlySalary: service.monthlySalary,
+      note: '由物业服务汇总行迁移',
+    }];
+  });
+  const oneOffSheet = findSheet('物业一次性');
+  if (oneOffSheet) {
+    const rows = getTemplateRows(wb, oneOffSheet);
+    const headerIdx = findHeader(rows, ['费用项目', '金额']);
+    if (headerIdx >= 0) {
+      for (const row of rows.slice(headerIdx + 1)) {
+        const name = String(row?.[0] || '').trim();
+        if (!name) continue;
+        budget.property.oneOffItems.push({ key: `property_${budget.property.oneOffItems.length}`, name, amount: Math.max(0, safeNumber(row?.[1])) });
+      }
+    }
+  }
+  const adminSheet = findSheet('行政开办');
+  if (adminSheet) {
+    const rows = getTemplateRows(wb, adminSheet);
+    const headerIdx = findHeader(rows, ['费用科目', '金额']);
+    if (headerIdx >= 0) {
+      for (const row of rows.slice(headerIdx + 1)) {
+        const name = String(row?.[0] || '').trim();
+        if (!name) continue;
+        const periodText = String(row?.[2] || '').trim();
+        budget.admin.items.push({
+          key: `admin_${budget.admin.items.length}`,
+          name,
+          amount: Math.max(0, safeNumber(row?.[1])),
+          period: /每月|月度/.test(periodText) ? 'monthly' : 'total',
+          months: Math.max(0, safeNumber(row?.[3])),
+          note: String(row?.[4] || '').trim(),
+        });
+      }
+    }
+  }
+  if (!budget.team.positions.length && !budget.property.services.length && !budget.admin.items.length) throw new Error('未在模板中识别到筹备团队、物业服务或行政开办数据，请使用最新模板');
+  if (!budget.team.positions.length) warnings.push('“筹备团队”工作表未识别到有效岗位');
+  if (!budget.property.services.length) warnings.push('“物业服务”工作表未识别到有效服务类别');
+  if (!budget.admin.items.length) warnings.push('“行政开办”工作表未识别到有效费用科目');
+  return {
+    preOpeningBudget: budget,
+    warnings,
+    teamCount: budget.team.positions.length,
+    serviceCount: budget.property.services.length,
+    adminCount: budget.admin.items.length,
+  };
+}
+
+function getTemplateRows(wb, sheetName) {
+  const sheet = wb.Sheets[sheetName];
+  return sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' }) : [];
+}
+
+function parseOperatingBudgetWorkbook(base64, filename) {
+  if (!/\.(xlsx|xlsm)$/i.test(filename)) throw new Error('运营成本预算仅支持 .xlsx 或 .xlsm 多工作表文件');
+  const wb = readWorkbook(base64, filename);
+  const warnings = [];
+  const organization = { departments: [] };
+  const officeBudget = {};
+  const leasingBudget = {};
+  const marketingBudget = { amountMode: true, annualItems: [], openingYearItems: [] };
+  const maintenanceBudget = {};
+  const propertyService = {};
+  const projectFields = {};
+  const operations = {};
+
+  const basicRows = getTemplateRows(wb, '基础参数');
+  const basicHeader = findHeaderRow(basicRows, { label: ['参数'], value: ['填写值'] }, ['label', 'value']);
+  if (basicHeader >= 0) {
+    const indexes = headerIndexes(basicRows[basicHeader], { label: ['参数'], value: ['填写值'] });
+    const defsByLabel = {};
+    BUDGET_BASIC_DEFS.forEach(item => {
+      defsByLabel[normalizeHeader(item.label)] = item;
+      (item.aliases || []).forEach(alias => { defsByLabel[normalizeHeader(alias)] = item; });
+    });
+    for (const row of basicRows.slice(basicHeader + 1)) {
+      const label = String(rowValue(row, indexes, 'label') || '').trim();
+      const raw = rowValue(row, indexes, 'value');
+      const def = defsByLabel[normalizeHeader(label)];
+      if (!def) continue;
+      if (def.path === 'operations.staffCostMode') {
+        operations.staffCostMode = String(raw || '').includes('面积') ? 'area' : 'organization';
+      } else {
+        let number = safeNumber(raw) * def.scale;
+        if (def.path === 'organization.annualSalaryMonths' && normalizeHeader(label) === normalizeHeader('年终奖月数')) number += 12;
+        const [group, key, nestedKey] = def.path.split('.');
+        if (group === 'organization') organization[key] = number;
+        else if (group === 'marketingBudget') marketingBudget[key] = number;
+        else if (group === 'operations' && key === 'annualCostOverrides' && nestedKey) {
+          operations.annualCostOverrides ||= {};
+          operations.annualCostOverrides[nestedKey] = number;
+        } else if (group === 'operations') operations[key] = number;
+      }
+    }
+  } else {
+    warnings.push('未找到“基础参数”工作表或表头');
+  }
+
+  const orgRows = getTemplateRows(wb, '组织架构');
+  const orgHeader = findHeaderRow(orgRows, { name: ['部门', '部门名称'], position: ['岗位', '岗位名称', '职位'], headcount: ['编制人数'], salary: ['税前应发月薪', '税前月薪', '平均月薪', '月薪'], note: ['岗位职责', '职责说明', '说明'] }, ['name', 'headcount', 'salary']);
+  if (orgHeader >= 0) {
+    const indexes = headerIndexes(orgRows[orgHeader], { name: ['部门', '部门名称'], position: ['岗位', '岗位名称', '职位'], headcount: ['编制人数'], salary: ['税前应发月薪', '税前月薪', '平均月薪', '月薪'], note: ['岗位职责', '职责说明', '说明'] });
+    const departmentMap = new Map();
+    for (const row of orgRows.slice(orgHeader + 1)) {
+      const name = String(rowValue(row, indexes, 'name') || '').trim();
+      if (!name) continue;
+      if (!departmentMap.has(name)) departmentMap.set(name, { name, note: '', positions: [] });
+      const department = departmentMap.get(name);
+      const positionName = String(rowValue(row, indexes, 'position') || '部门综合岗位').trim() || '部门综合岗位';
+      const note = String(rowValue(row, indexes, 'note') || '').trim();
+      department.positions.push({
+        name: positionName,
+        headcount: safeNumber(rowValue(row, indexes, 'headcount')),
+        avgMonthlySalary: safeNumber(rowValue(row, indexes, 'salary')),
+        note,
+      });
+    }
+    organization.departments = [...departmentMap.values()];
+  }
+  if (!organization.departments.length) warnings.push('组织架构工作表没有有效部门或岗位记录');
+
+  const serviceRows = getTemplateRows(wb, '物业服务模式');
+  const serviceHeader = findHeaderRow(serviceRows, { name: ['服务类别', '服务项目'], mode: ['服务模式'], factor: ['非驻场折算比例', '折算比例'], fee: ['第三方综合管理费率', '管理费率'] }, ['name', 'mode']);
+  if (serviceHeader >= 0) {
+    const indexes = headerIndexes(serviceRows[serviceHeader], { name: ['服务类别', '服务项目'], mode: ['服务模式'], factor: ['非驻场折算比例', '折算比例'], fee: ['第三方综合管理费率', '管理费率'] });
+    const keyByName = Object.fromEntries(PROPERTY_SERVICE_DEFS.map(item => [normalizeHeader(item.name), item.key]));
+    for (const row of serviceRows.slice(serviceHeader + 1)) {
+      const name = String(rowValue(row, indexes, 'name') || '').trim();
+      const key = keyByName[normalizeHeader(name)];
+      if (!key) continue;
+      const rawMode = normalizeHeader(rowValue(row, indexes, 'mode'));
+      const mode = rawMode.includes('非常驻') ? 'non_resident' : rawMode.includes('外包') || rawMode.includes('第三方') ? 'resident_outsourced' : 'self';
+      const factorValue = rowValue(row, indexes, 'factor');
+      const feeValue = rowValue(row, indexes, 'fee');
+      propertyService[key] = {
+        mode,
+        nonResidentFactor: factorValue === '' ? 0.70 : Math.min(1, Math.max(0, safeNumber(factorValue) / 100)),
+        managementFeeRate: feeValue === '' ? 0.12 : Math.max(0, safeNumber(feeValue) / 100),
+      };
+    }
+  }
+
+  const channelRows = getTemplateRows(wb, '招商渠道核算');
+  const channelHeader = findHeaderRow(channelRows, { label: ['参数'], value: ['填写值'] }, ['label', 'value']);
+  if (channelHeader >= 0) {
+    const indexes = headerIndexes(channelRows[channelHeader], { label: ['参数'], value: ['填写值'] });
+    for (const row of channelRows.slice(channelHeader + 1)) {
+      const label = normalizeHeader(rowValue(row, indexes, 'label'));
+      const raw = rowValue(row, indexes, 'value');
+      if (!label || raw === '') continue;
+      if (label.includes('核算方式')) leasingBudget.channelCalculationMode = normalizeHeader(raw).includes('面积') ? 'area_rent' : 'amount';
+      else if (label.includes('面积比例')) leasingBudget.channelAreaRatio = Math.min(1, Math.max(0, safeNumber(raw) / 100));
+      else if (label.includes('租金单价')) leasingBudget.channelRentPerSqmMonth = Math.max(0, safeNumber(raw));
+      else if (label.includes('租金倍数')) leasingBudget.channelCommissionMonths = Math.max(0, safeNumber(raw));
+    }
+  }
+
+  const leasingStageRows = getTemplateRows(wb, '招商调整阶段');
+  const leasingStageHeader = findHeaderRow(leasingStageRows, {
+    name: ['阶段名称'],
+    start: ['起始运营年', '起始年'],
+    end: ['结束运营年', '结束年'],
+    rent: ['租金调整幅度'],
+    occupancy: ['目标出租率'],
+    cost: ['一次性招商成本'],
+    note: ['调整说明', '说明'],
+  }, ['name', 'start', 'end']);
+  if (leasingStageHeader >= 0) {
+    const indexes = headerIndexes(leasingStageRows[leasingStageHeader], {
+      name: ['阶段名称'],
+      start: ['起始运营年', '起始年'],
+      end: ['结束运营年', '结束年'],
+      rent: ['租金调整幅度'],
+      occupancy: ['目标出租率'],
+      cost: ['一次性招商成本'],
+      note: ['调整说明', '说明'],
+    });
+    const periods = leasingStageRows.slice(leasingStageHeader + 1).map((row, index) => {
+      const name = String(rowValue(row, indexes, 'name') || '').trim();
+      if (!name) return null;
+      const startYear = Math.max(1, Math.round(safeNumber(rowValue(row, indexes, 'start'))));
+      return {
+        id: `imported_leasing_stage_${index + 1}`,
+        name,
+        startYear,
+        endYear: Math.max(startYear, Math.round(safeNumber(rowValue(row, indexes, 'end')) || startYear)),
+        rentAdjustmentRate: safeNumber(rowValue(row, indexes, 'rent')) / 100,
+        targetOccupancy: Math.min(1, Math.max(0, safeNumber(rowValue(row, indexes, 'occupancy'))) / 100),
+        oneOffLeasingCost: Math.max(0, safeNumber(rowValue(row, indexes, 'cost'))),
+        note: String(rowValue(row, indexes, 'note') || '').trim(),
+      };
+    }).filter(Boolean);
+    if (periods.length) operations.leasingAdjustmentPeriods = periods;
+  }
+
+  const preopeningRows = getTemplateRows(wb, '筹备期成本');
+  const preopeningHeader = findHeaderRow(preopeningRows, { label: ['参数'], value: ['填写值'] }, ['label', 'value']);
+  if (preopeningHeader >= 0) {
+    const indexes = headerIndexes(preopeningRows[preopeningHeader], { label: ['参数'], value: ['填写值'] });
+    const defsByLabel = Object.fromEntries(PREOPENING_DEFS.map(item => [normalizeHeader(item.label), item]));
+    for (const row of preopeningRows.slice(preopeningHeader + 1)) {
+      const def = defsByLabel[normalizeHeader(rowValue(row, indexes, 'label'))];
+      if (!def) continue;
+      const value = safeNumber(rowValue(row, indexes, 'value')) * def.scale;
+      if (def.path.startsWith('operations.')) operations[def.path.split('.')[1]] = value;
+      if (def.path.startsWith('project.')) projectFields[def.path.split('.')[1]] = value;
+    }
+  }
+
+  const rentCollectionRows = getTemplateRows(wb, '租赁收款条款');
+  const rentCollectionHeader = findHeaderRow(rentCollectionRows, { label: ['参数'], value: ['填写值'] }, ['label', 'value']);
+  if (rentCollectionHeader >= 0) {
+    const indexes = headerIndexes(rentCollectionRows[rentCollectionHeader], { label: ['参数'], value: ['填写值'] });
+    for (const row of rentCollectionRows.slice(rentCollectionHeader + 1)) {
+      const label = normalizeHeader(rowValue(row, indexes, 'label'));
+      const raw = rowValue(row, indexes, 'value');
+      if (label.includes('收取方式')) {
+        operations.rentCollectionMode = /仅.*预付/.test(String(raw)) ? 'prepaid_only' : /仅.*押|保证金/.test(String(raw)) ? 'deposit_only' : 'deposit_and_prepaid';
+      } else if (label.includes('保证金')) {
+        operations.depositMonths = Math.max(0, safeNumber(raw));
+      } else if (label.includes('预付租金')) {
+        operations.prepaidRentMonths = Math.max(0, safeNumber(raw));
+      }
+    }
+  }
+
+  function parseAmountSheet(sheetName, defs, target, periodTarget = null) {
+    const rows = getTemplateRows(wb, sheetName);
+    const header = findHeaderRow(rows, { name: ['费用项目', '维保项目', '营销类别', '开业专项'], amount: ['录入金额', '年度金额', '首年金额'] }, ['name', 'amount']);
+    if (header < 0) return;
+    const indexes = headerIndexes(rows[header], { name: ['费用项目', '维保项目', '营销类别', '开业专项'], amount: ['录入金额', '年度金额', '首年金额'], period: ['录入周期', '周期'], note: ['说明', '费用内容'] });
+    const keyByLabel = Object.fromEntries(defs.map(([label, key]) => [normalizeHeader(label), key]));
+    for (const row of rows.slice(header + 1)) {
+      const label = String(rowValue(row, indexes, 'name') || '').trim();
+      const key = keyByLabel[normalizeHeader(label)];
+      if (!key) continue;
+      const rawPeriod = normalizeHeader(rowValue(row, indexes, 'period'));
+      const isMonthly = rawPeriod.includes('月') && !rawPeriod.includes('年');
+      const amountHeader = String(rowValue(rows[header], indexes, 'amount') || '');
+      const unitScale = /万元/.test(amountHeader) ? 1 : /元/.test(amountHeader) ? 0.0001 : 1;
+      target[key] = safeNumber(rowValue(row, indexes, 'amount')) * unitScale * (isMonthly ? 12 : 1);
+      if (periodTarget) periodTarget[key] = isMonthly ? 'monthly' : 'annual';
+    }
+  }
+  function parseOfficeBudgetSheet() {
+    const rows = getTemplateRows(wb, '办公预算');
+    const header = findHeaderRow(rows, { name: ['费用项目'], amount: ['录入金额', '年度金额'] }, ['name', 'amount']);
+    if (header < 0) return;
+    const indexes = headerIndexes(rows[header], { name: ['费用项目'], amount: ['录入金额', '年度金额'], period: ['录入周期', '周期'], note: ['说明', '费用内容'] });
+    const keyByLabel = Object.fromEntries(OFFICE_BUDGET_DEFS.map(([label, key]) => [normalizeHeader(label), key]));
+    const amountHeader = String(rowValue(rows[header], indexes, 'amount') || '');
+    const unitScale = /万元/.test(amountHeader) ? 1 : /元/.test(amountHeader) ? 0.0001 : 1;
+    const items = [];
+    rows.slice(header + 1).forEach((row, index) => {
+      const name = String(rowValue(row, indexes, 'name') || '').trim();
+      if (!name) return;
+      const key = keyByLabel[normalizeHeader(name)] || `importedOffice_${index + 1}`;
+      const rawPeriod = normalizeHeader(rowValue(row, indexes, 'period'));
+      const isMonthly = rawPeriod.includes('月') && !rawPeriod.includes('年');
+      const annual = safeNumber(rowValue(row, indexes, 'amount')) * unitScale * (isMonthly ? 12 : 1);
+      items.push({
+        id: key,
+        name,
+        annual,
+        period: isMonthly ? 'monthly' : 'annual',
+        note: String(rowValue(row, indexes, 'note') || '').trim(),
+      });
+      if (keyByLabel[normalizeHeader(name)]) officeBudget.inputPeriods[key] = isMonthly ? 'monthly' : 'annual';
+    });
+    if (items.length) {
+      officeBudget.items = items;
+      officeBudget.itemSchema = 1;
+    }
+  }
+  officeBudget.inputPeriods = {};
+  leasingBudget.inputPeriods = {};
+  parseOfficeBudgetSheet();
+  parseAmountSheet('招商预算', LEASING_BUDGET_DEFS, leasingBudget, leasingBudget.inputPeriods);
+  parseAmountSheet('维保预算', MAINTENANCE_BUDGET_DEFS, maintenanceBudget);
+  const annualMarketingAmounts = {};
+  const openingMarketingAmounts = {};
+  parseAmountSheet('营销常规预算', MARKETING_ANNUAL_DEFS, annualMarketingAmounts);
+  parseAmountSheet('开业首年营销', MARKETING_OPENING_DEFS, openingMarketingAmounts);
+  marketingBudget.annualItems = MARKETING_ANNUAL_DEFS.map(([name, key]) => ({
+    key,
+    name,
+    amount: safeNumber(annualMarketingAmounts[key]),
+    note: '',
+  }));
+  marketingBudget.openingYearItems = MARKETING_OPENING_DEFS.map(([name, key]) => ({
+    key,
+    name,
+    amount: safeNumber(openingMarketingAmounts[key]),
+    note: '',
+  }));
+  if (!Object.keys(annualMarketingAmounts).length) warnings.push('营销常规预算工作表没有有效金额记录');
+  if (!Object.keys(openingMarketingAmounts).length) warnings.push('开业首年营销工作表没有有效金额记录');
+  marketingBudget.hasImportedAmounts = Boolean(Object.keys(annualMarketingAmounts).length || Object.keys(openingMarketingAmounts).length);
+
+  return { organization, propertyService, projectFields, officeBudget, leasingBudget, marketingBudget, maintenanceBudget, operations, warnings };
+}
+
+function normalizedBuildingChargeConfigs(model, result) {
+  const rows = [
+    ...(Array.isArray(result?.floors) ? result.floors : []),
+    ...(Array.isArray(result?.shops) ? result.shops : []),
+  ];
+  const names = [...new Set(rows.map(row => String(row.building || '1号楼').trim() || '1号楼'))]
+    .sort((a, b) => a.localeCompare(b, 'zh-CN', { numeric: true }));
+  const rawConfigs = Array.isArray(model.revenues?.centralAcBuildings)
+    ? model.revenues.centralAcBuildings
+    : Object.entries(model.revenues?.centralAcBuildings || {}).map(([building, value]) => ({ building, ...(value || {}) }));
+  const configuredBuildings = new Map(rawConfigs
+    .map(item => [String(item?.building || '').trim(), item])
+    .filter(([building]) => building));
+  const defaultCentralAcFee = Number(model.revenues?.centralAcFee || 0);
+  return names.map(building => {
+    const configured = configuredBuildings.get(building) || {};
+    return {
+      building,
+      enabled: Boolean(configured.enabled),
+      fee: configured.fee === null || configured.fee === undefined ? defaultCentralAcFee : Number(configured.fee || 0),
+    };
+  });
+}
+
+function buildOperatingLedgerExportRows(result) {
+  const model = result?.model || {};
+  const annual = (result?.annual || []).filter(row => Number(row.opYear) > 0);
+  const stableYear = Math.max(1, Number(model.operations?.stableYear || 3));
+  const stable = annual.find(row => Number(row.opYear) === stableYear) || annual.at(-1) || {};
+  const sum = key => annual.reduce((total, row) => total + Number(row[key] || 0), 0);
+  const rentArea = Array.isArray(result?.shops)
+    ? result.shops.reduce((total, shop) => total + Number(shop.rentArea || 0), 0)
+    : (result?.floors || []).reduce((total, floor) => total + Number(floor.rentArea || 0), 0);
+  const centralConfigs = normalizedBuildingChargeConfigs(model, result);
+  const enabledCentral = centralConfigs.filter(item => item?.enabled && Number(item?.fee || model.revenues?.centralAcFee || 0) > 0).length;
+  const reason = key => {
+    if (key === 'propertyManagementRevenue' && Number(model.revenues?.propertyFee || 0) <= 0) return '物业管理费单价为0';
+    if (key === 'commercialManagementRevenue' && Number(model.revenues?.commercialManagementFee || 0) <= 0) return '商业管理费单价为0';
+    if (key === 'centralAcRevenue' && !centralConfigs.length) return '没有设置楼栋中央空调收费';
+    if (key === 'centralAcRevenue' && !enabledCentral) return '所有楼栋中央空调收费开关关闭，或启用楼栋单价为0';
+    if (key === 'staffCost') return '组织架构编制人数为0或岗位未配置';
+    if (key === 'marketingCost') return '年度营销预算为0';
+    if (key === 'ownerRent') return '业主租金未启用，或租赁基数/单价为0';
+    if (key === 'outsourcedManagementFee') return '物业服务均为自营模式，或岗位成本为0';
+    if (key === 'rentRevenue' && rentArea <= 0) return '商户计租面积为0';
+    if (key === 'otherRevenue') return '停车位、停车月租及其他收入比例未设置';
+    return '对应输入参数为0或当前年度未形成有效数据';
+  };
+  const definitions = [
+    ['收入', '租金及联营收入（不含税）', 'rentRevenue', '保底租金 + 联营扣点', false],
+    ['收入', '物业管理费收入', 'propertyManagementRevenue', '计租面积 × 物业费单价 × 12 × 出租率 × 递增因子', false],
+    ['收入', '商业管理费收入', 'commercialManagementRevenue', '计租面积 × 商管费单价 × 12 × 出租率 × 递增因子', false],
+    ['收入', '中央空调使用费收入', 'centralAcRevenue', '启用楼栋计租面积 × 空调单价 × 12 × 出租率 × 递增因子', false],
+    ['收入小计', '三项经营性费用收入合计', 'propertyRevenue', '物业费 + 商管费 + 空调费', true],
+    ['收入', '其他收入', 'otherRevenue', '停车收入 + 其他收入比例', false],
+    ['收入合计', '营业收入合计（不含税）', 'revenue', '租金及联营 + 三项费用 + 其他收入', true],
+    ['成本', '人员及物业服务成本', 'staffCost', '组织架构工资社保 + 物业服务岗位 + 第三方管理费 + 招聘培训', false],
+    ['成本', '公共能耗', 'energyCost', '面积 × 能耗单价 × 12 × 出租率', false],
+    ['成本', '物业基础运营', 'propertyOpsCost', '面积 × 物业运营单价', false],
+    ['成本', '办公行政', 'officeCost', '行政预算或面积参考单价', false],
+    ['成本', '招商费用', 'leasingCost', '年度招商预算 + 续租佣金', false],
+    ['成本', '年度营销推广', 'marketingCost', '常规营销 + 开业首年专项', false],
+    ['成本', '日常及专项维保', 'maintenanceCost', '固定维保 + 工程投资 × 维保比例', false],
+    ['成本', '业主租金支出', 'ownerRent', '土地租赁 + 物业租赁', false],
+    ['成本', '其他运营费用', 'otherOpexCost', '营业收入 × 其他运营费率', false],
+    ['成本', '经营税费', 'taxes', '房产税 + 土地使用税 + 印花税 + 附加税 + 地方基金', true],
+    ['成本', '运营成本（不含业主租金）', 'operatingCostExOwnerRent', '不含业主租金的成本项目合计 - 可抵扣进项税', false],
+    ['成本合计', '运营成本合计（含业主租金）', 'operatingCost', '运营成本（不含业主租金）+ 业主租金', true],
+    ['经营结果', 'NOI', 'noi', '营业收入 - 运营成本（含业主租金） - 经营税费', true],
+    ['备注口径', '其中：第三方物业服务管理费', 'outsourcedManagementFee', '已包含在人员及物业服务成本中，不重复汇总', false],
+  ];
+  return definitions.map(([section, name, key, formula, total]) => {
+    const stableValue = Number(stable[key] || 0);
+    const cumulative = sum(key);
+    return [section, name, formula, stableValue / 12, stableValue, cumulative, stableValue === 0 ? reason(key) : '已形成有效数据', total ? '合计' : '明细'];
+  });
+}
+
+function naturalYearReportSheetRows(result) {
+  return [
+    ['自然年', '实际开始日期', '实际结束日期', '有效月数', '是否不足一年', '出租率', '收租率', '应收租金（万元）', '未收租金（万元）', '实收租金（万元）', '物业费收入（万元）', '商管费收入（万元）', '空调费收入（万元）', '三项费用合计（万元）', '其他收入（万元）', '总收入（万元）', '运营成本（不含业主租金，万元）', '业主租金（万元）', '税费（万元）', '项目所得税（万元）', '资本支出（万元）', '总支出（万元）', '调整额（万元）', '调整后净现金流（万元）', '累计运营现金流（万元）', '调整说明'],
+    ...(result.naturalYearReport || []).map(row => {
+      const ownerRent = Number(row.ownerRent || 0);
+      const operatingExOwner = Number(row.cashOperatingCostExOwnerRent ?? (Number(row.cashOperatingCost || row.operatingCost || 0) - ownerRent));
+      return [row.calendarYear, row.periodStart || '', row.periodEndExclusive || '', row.activeMonths || 0, row.isPartialYear ? '是' : '否', row.occupancy || 0, row.rentCollectionRate || 0, row.scheduledRentRevenue || 0, row.uncollectedRentRevenue || 0, row.collectedRentRevenue || row.rentRevenue || 0, row.propertyManagementRevenue || 0, row.commercialManagementRevenue || 0, row.centralAcRevenue || 0, (row.propertyManagementRevenue || 0) + (row.commercialManagementRevenue || 0) + (row.centralAcRevenue || 0), row.otherRevenue || 0, row.totalIncome || 0, operatingExOwner, ownerRent, row.taxes || 0, row.projectIncomeTax || 0, row.projectCapex || 0, row.totalExpense || 0, (row.revenueAdjustment || 0) + (row.operatingCostAdjustment || 0) + (row.taxAdjustment || 0) + (row.capexAdjustment || 0), row.adjustedProjectCashFlow || 0, row.cumulativeOperationCashFlow || 0, row.adjustmentNote || ''];
+    })
+  ];
+}
+
+function naturalYearAdjustmentWorkbook(result) {
+  const wb = XLSX.utils.book_new();
+  const rows = [
+    ['自然年调整模板'],
+    ['按项目设定运营年限生成自然年区间；请只修改“调整额”和备注，不要改自然年和原始数据。调整额单位为万元，可为正数或负数。'],
+    [],
+    ['自然年', '实际开始日期', '实际结束日期', '有效月数', '原收入（万元）', '原运营成本（万元）', '原税费（万元）', '原资本支出（万元）', '收入调整额（万元）', '运营成本调整额（万元）', '税费调整额（万元）', '资本支出调整额（万元）', '备注'],
+    ...(result.naturalYearReport || []).map(row => [row.calendarYear, row.periodStart || '', row.periodEndExclusive || '', row.activeMonths || 0, row.totalIncome || 0, row.cashOperatingCost || 0, row.taxes || 0, row.projectCapex || 0, row.revenueAdjustment || 0, row.operatingCostAdjustment || 0, row.taxAdjustment || 0, row.capexAdjustment || 0, row.adjustmentNote || ''])
+  ];
+  addSheet(wb, '自然年调整模板', rows, [12, 18, 18, 10, 18, 20, 16, 18, 20, 22, 18, 22, 40]);
+  return wb;
+}
+
+function parseNaturalYearAdjustments(base64, filename = '') {
+  const wb = XLSX.read(base64, { type: 'base64' });
+  const sheetName = wb.SheetNames.find(name => name.includes('自然年')) || wb.SheetNames[0];
+  if (!sheetName || !wb.Sheets[sheetName]) throw new Error('未找到自然年调整工作表');
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, raw: false, defval: '' });
+  const headerIndex = rows.findIndex(row => String(row[0] || '').includes('自然年') && String(row[8] || '').includes('收入调整'));
+  if (headerIndex < 0) throw new Error('表头不完整，请使用系统下载的自然年调整模板');
+  const headers = rows[headerIndex].map(value => String(value || '').replace(/[（(].*?[）)]/g, '').trim());
+  const indexOf = aliases => headers.findIndex(header => aliases.some(alias => header.includes(alias)));
+  const indexes = {
+    year: indexOf(['自然年']), revenue: indexOf(['收入调整额']), operatingCost: indexOf(['运营成本调整额']),
+    tax: indexOf(['税费调整额']), capex: indexOf(['资本支出调整额']), note: indexOf(['备注'])
+  };
+  if (indexes.year < 0 || indexes.revenue < 0) throw new Error('缺少自然年或调整额列');
+  const adjustments = [];
+  for (const row of rows.slice(headerIndex + 1)) {
+    const year = Number(row[indexes.year]);
+    if (!Number.isFinite(year) || year <= 0) continue;
+    adjustments.push({
+      calendarYear: year,
+      revenueAdjustment: Number(row[indexes.revenue] || 0) || 0,
+      operatingCostAdjustment: Number(row[indexes.operatingCost] || 0) || 0,
+      taxAdjustment: Number(row[indexes.tax] || 0) || 0,
+      capexAdjustment: Number(row[indexes.capex] || 0) || 0,
+      note: String(row[indexes.note] || '').trim(),
+    });
+  }
+  return { adjustments, warnings: adjustments.length ? [] : ['没有识别到有效自然年调整行'] };
+}
+
+async function exportExcel(result) {
+  const model = result.model;
+  const s = result.summary;
+  const formulas = model.formulas || {};
+  const developmentLabels = { new_build: '新建项目', renovation: '旧改 / 存量改造项目', operating: '运营中项目', light_asset: '轻资产运营项目' };
+  const growthModeLabels = { none: '不递增', compound: '每年复利递增', simple: '每年单利递增', step: '每N年阶梯递增' };
+  const settlementPresetLabels = { shopping: '购物中心行业常规', department: '百货商场行业常规', outlet: '奥特莱斯行业常规', street: '街区商业行业常规', community: '社区商业行业常规', community_base: '社区底商行业常规' };
+  const ownerRentGrowthLabels = { none: '不复递增', compound: '按比例复利递增', simple: '按比例单利递增', fixed_amount: '每年固定金额递增', step: '每N年阶梯递增' };
+  const ownerRentLeaseLabels = { land: '仅土地租赁', property: '仅物业租赁', land_and_property: '土地+物业租赁' };
+  const propertyRightsLabels = { owned: '自有产权', leased: '租赁物业', equity: '股权持有', government: '政府划拨/合作持有', other: '其他产权安排' };
+  const acquisitionMethodLabels = { market_auction: '招拍挂/市场竞得', negotiated_transfer: '协议转让', equity_acquisition: '股权收购', government_allocation: '政府划拨/定向供应', lease: '租赁取得', other: '其他方式' };
+  const buildingStatusLabels = { under_construction: '在建/待建', completed_unopened: '已竣工未开业', operating: '已开业运营中', renovation_pending: '待改造/停业改造' };
+  const wb = XLSX.utils.book_new();
+  addSheet(wb, '项目概览', [
+    ['多多 · 商业地产投资测算'], [''],
+    ['项目名称', s.projectName], ['项目位置', s.location], ['项目开发状态', developmentLabels[s.developmentType] || s.developmentType || '新建项目'], ['商业项目形态', model.project.projectType], ['产权状态', propertyRightsLabels[model.project.propertyRightsStatus] || '自有产权'], ['取得方式', acquisitionMethodLabels[model.project.acquisitionMethod] || '招拍挂/市场竞得'], ['建设/经营状态', buildingStatusLabels[model.project.buildingStatus] || '在建/待建'], ['商户租金核算面积口径', model.project.rentAreaBasis === 'building' ? '建筑面积' : '实用面积（套内/租赁面积）'], ['业主租金支付面积口径', model.project.ownerRentAreaBasis === 'leasable' ? '实用/可租赁面积' : '建筑面积'], ['测算模式', s.calculationMode === 'preliminary' ? '楼层均价初步测算' : '一铺一价精细测算'],
+    ['总建筑面积（㎡）', s.grossFloorArea], ['可租赁面积（㎡）', s.leasableArea], ['商铺/楼层数量', s.calculationMode === 'preliminary' ? s.floorCount : s.shopsCount],
+    ['项目立项 / 进场日期', s.investmentDate || ''], ['建设开工日期', s.constructionStartDate || ''], ['计划竣工日期', s.constructionEndDate || ''], ['项目接管 / 进场日期', s.handoverDate || ''], ['招商启动日期', s.leasingStartDate || ''], ['计划开业日期', s.openingDate || ''], ['运营结束日期', s.operationEndDate || ''],
+    ['项目总投资（万元）', s.totalInvestment], ['稳定期营业收入（万元/年）', s.stableRevenue], ['稳定期物业管理费收入（万元/年）', s.stablePropertyManagementIncome || 0], ['稳定期商业管理费收入（万元/年）', s.stableCommercialManagementIncome || 0], ['稳定期中央空调费收入（万元/年）', s.stableCentralAcIncome || 0], ['稳定期三项费用收入合计（万元/年）', s.stablePropertyFeeIncome || 0], ['业主租金支出（万元/年）', s.stableOwnerRentCost || 0], ['稳定期NOI（万元/年）', s.stableNoi],
+    ['NOI回报率', s.noiYield], ['周期净利润（万元）', s.periodNetProfit || 0], ['周期净利率', s.periodProfitMargin || 0], ['项目盈利合计（万元）', s.projectProfitTotal ?? s.projectNetCashProfit ?? 0], ['稳定年商业及运营管理成本（不含业主租金，万元）', s.stableCommercialManagementCost || 0], ['稳定年扣除商业管理成本后经营结余（万元）', s.stableCommercialOperatingBalance || 0], ['运营期商业及运营管理成本累计（万元）', s.periodCommercialManagementCost || 0], ['运营期扣除商业管理成本后经营结余累计（万元）', s.periodCommercialOperatingBalance || 0], ['原始建设投资（万元）', s.hardInvestment || 0], ['招商运营启动投入（万元）', s.softPreopeningInvestment || 0], ['运营现金回收（万元）', s.capitalRecoveredByOperation || 0], ['原始投入回收率', s.initialInvestmentRecoveryRate || 0], ['未回收原始投入（万元）', s.unrecoveredInitialInvestment || 0], ['原始投入是否全部回收', s.initialInvestmentFullyRecovered ? '是' : '否'], ['项目IRR', s.projectIrr], ['项目NPV（万元）', s.projectNpv], ['静态回收期（年）', s.staticPayback], ['期末退出价值（万元）', s.exitValueIncluded ? (s.exitValue || 0) : 0], ['期末退出价值口径', s.exitValueIncluded ? '已计入最后一年现金流' : (s.exitValueBlockedReason || '不计入')],
+    [''], ['说明', '本表由浏览器版多多·商业地产自动生成，用于投资初筛与方案比较，不替代可研、审计、评估或税务鉴证。'],
+  ], [26, 32, 22, 22]);
+  addSheet(wb, '核心参数', [
+    ['参数大类', '参数', '数值'],
+    ['项目', '开发状态', developmentLabels[model.project.developmentType] || model.project.developmentType || '新建项目'], ['项目', '起始年份', model.project.startYear], ['项目', '建设期（年）', model.project.constructionYears],
+    ['项目', '产权状态', propertyRightsLabels[model.project.propertyRightsStatus] || '自有产权'], ['项目', '取得方式', acquisitionMethodLabels[model.project.acquisitionMethod] || '招拍挂/市场竞得'], ['项目', '建设/经营状态', buildingStatusLabels[model.project.buildingStatus] || '在建/待建'],
+    ['项目', '招商运营年限（年）', model.project.operationYears], ['项目', '项目立项日期', model.project.investmentDate || ''], ['项目', '建设开工日期', model.project.constructionStartDate || ''], ['项目', '计划竣工日期', model.project.constructionEndDate || ''], ['项目', '项目接管日期', model.project.handoverDate || ''], ['项目', '招商启动日期', model.project.leasingStartDate || ''], ['项目', '计划开业日期', model.project.openingDate || ''], ['项目', '运营结束日期', model.project.operationEndDate || ''], ['项目', '商户租金核算面积口径', model.project.rentAreaBasis === 'building' ? '建筑面积' : '实用面积（套内/租赁面积）'], ['项目', '业主租金支付面积口径', model.project.ownerRentAreaBasis === 'leasable' ? '实用/可租赁面积' : '建筑面积'], ['项目', '建筑面积调节系数', model.project.commonAreaFactor],
+    ['业主租金', '是否支付', model.ownerRent?.enabled ? '是' : '否'], ['业主租金', '租赁标的', ownerRentLeaseLabels[model.ownerRent?.leaseType] || '仅物业租赁'],
+    ['业主租金', '土地计价方式', model.ownerRent?.landPricingMode === 'unit' ? '按面积单价' : '按月度总额'],
+    ['业主租金', '土地面积（㎡）', model.ownerRent?.landArea || 0], ['业主租金', '土地单价（元/㎡/月）', model.ownerRent?.landUnitRent || 0],
+    ['业主租金', '土地月租金（万元/月）', model.ownerRent?.landMonthlyRent || 0], ['业主租金', '土地支付月数', model.ownerRent?.landPaymentMonths || 0],
+    ['业主租金', '物业计价方式', model.ownerRent?.propertyPricingMode === 'unit' ? '按面积单价' : model.ownerRent?.propertyPricingMode === 'annual_total' ? '按年租金总额' : '按月度总额'],
+    ['业主租金', '业主租金支付面积口径', model.project?.ownerRentAreaBasis === 'leasable' ? '实用/可租赁面积' : '建筑面积'],
+    ['业主租金', '物业面积覆盖（㎡）', model.ownerRent?.propertyArea || 0], ['业主租金', '物业单价（元/㎡/月）', s.ownerPropertyUnitRentComputed || model.ownerRent?.propertyUnitRent || 0],
+    ['业主租金', '物业月租金（万元/月）', s.ownerPropertyMonthlyRentComputed || model.ownerRent?.propertyMonthlyRent || 0], ['业主租金', '物业年租金总价（万元/年）', model.ownerRent?.propertyAnnualRent || 0], ['业主租金', '实际用于反算的面积（㎡）', s.ownerPropertyAreaUsed || 0], ['业主租金', '物业支付月数', model.ownerRent?.propertyPaymentMonths || 0],
+    ['业主租金', '递增方式', ownerRentGrowthLabels[model.ownerRent?.growthMode] || '不复递增'],
+    ['业主租金', '递增率', model.ownerRent?.growthRate || 0], ['业主租金', '每年增加额（万元/年）', model.ownerRent?.annualIncrease || 0],
+    ['业主租金', '付款时点', model.ownerRent?.paymentTiming === 'prepay' ? '先付后用' : '先用后付'], ['业主租金', '付款频率', model.ownerRent?.paymentFrequency || 'monthly'], ['业主租金', '起付日期', model.ownerRent?.paymentStartDate || ''], ['业主租金', '免租开始日期', model.ownerRent?.rentFreeStartDate || ''], ['业主租金', '免租结束日期', model.ownerRent?.rentFreeEndDate || ''], ['业主租金', '保证金（万元）', model.ownerRent?.depositAmount || 0],
+    ['成本', '投资录入方式', model.costs?.inputMode === 'amount' ? '按实际投资总额' : '按建筑面积单价'], ['成本', '专项经营投资（万元）', s.specialInvestmentTotal || 0],
+    ['成本', '前期工程单价（元/㎡）', model.costs.preconstructionRate], ['成本', '土建工程单价（元/㎡）', model.costs.constructionRate],
+    ['成本', '装修单价（元/㎡）', model.costs.fitoutRate], ['成本', '设备单价（元/㎡）', model.costs.equipmentRate],
+    ['运营', '首年最低出租率', model.operations.occupancyY1], ['运营', '第二年出租率', model.operations.occupancyY2],
+    ['运营', '阶段性招商调整期数量', Array.isArray(model.operations?.leasingAdjustmentPeriods) ? model.operations.leasingAdjustmentPeriods.length : 0],
+    ['运营', '稳定期出租率', model.operations.stableOccupancy], ['运营', '租金递增方式', growthModeLabels[formulas.rentGrowthMode] || formulas.rentGrowthMode],
+    ['运营', '租金年递增率', model.operations.rentGrowth], ['运营', '租金递增周期（阶梯）', model.operations.rentStepYears],
+    ['运营', '租金阶梯递增率', model.operations.rentStepRate],
+    ['运营', '首年物业管理费单价（元/㎡/月）', model.revenues.propertyFee], ['运营', '物业管理费递增方式', growthModeLabels[formulas.propertyFeeGrowthMode] || formulas.propertyFeeGrowthMode],
+    ['运营', '物业管理费年递增率', model.operations.propertyFeeGrowth], ['运营', '物业管理费递增周期（阶梯）', model.operations.propertyFeeStepYears], ['运营', '物业管理费阶梯递增率', model.operations.propertyFeeStepRate],
+    ['运营', '首年商业管理费单价（元/㎡/月）', model.revenues.commercialManagementFee], ['运营', '商业管理费递增方式', growthModeLabels[formulas.commercialManagementGrowthMode] || formulas.commercialManagementGrowthMode],
+    ['运营', '商业管理费年递增率', model.operations.commercialManagementGrowth], ['运营', '商业管理费递增周期（阶梯）', model.operations.commercialManagementStepYears], ['运营', '商业管理费阶梯递增率', model.operations.commercialManagementStepRate],
+    ['运营', '默认中央空调费单价（元/㎡/月）', model.revenues.centralAcFee], ['运营', '中央空调费递增方式', growthModeLabels[formulas.centralAcGrowthMode] || formulas.centralAcGrowthMode],
+    ['运营', '中央空调费年递增率', model.operations.centralAcGrowth], ['运营', '中央空调费递增周期（阶梯）', model.operations.centralAcStepYears], ['运营', '中央空调费阶梯递增率', model.operations.centralAcStepRate],
+    ['运营成本', '办公行政年度金额（万元/年）', s.stableOfficeCost || 0], ['运营成本', '办公行政月均金额（万元/月）', s.monthlyOfficeCost || 0],
+    ['招商费用', '渠道核算方式', s.channelCalculationMode === 'area_rent' ? '渠道面积×首年月租金×倍数' : '直接金额'], ['招商费用', '渠道招商面积比例', s.channelAreaRatio || 0],
+    ['招商费用', '渠道招商面积（㎡）', s.channelArea || 0], ['招商费用', '采用首年月租金（元/㎡/月）', s.channelRentPerSqmMonth || 0],
+    ['招商费用', '首年月租金倍数', s.channelCommissionMonths || 0], ['招商费用', '渠道及代理费年度金额（万元/年）', s.annualChannelFee || 0], ['招商费用', '渠道及代理费月均（万元/月）', s.monthlyChannelFee || 0],
+    ['运营成本参考', '运营标准', model.operations.opexPreset?.standard || 'standard'], ['运营成本参考', '管理模式', model.operations.opexPreset?.managementMode || 'mixed'],
+    ['运营成本参考', '所在地参考', model.operations.opexPreset?.locationLabel || model.project.location],
+    ...(result.propertyServiceBreakdown || []).map(item => ['物业服务', `${item.name}模式`, item.modeLabel || PROPERTY_SERVICE_MODE_LABELS[item.mode] || item.mode]),
+    ['物业服务', '第三方综合管理费（万元/年）', s.annualOutsourcedManagementFee || 0], ['物业服务', '年度物业服务总成本（万元/年）', s.annualPropertyServiceTotal || 0],
+    ['税费', '租金增值税', model.taxes.vatRent], ['税费', '房产税（从租）', model.taxes.propertyTaxRateRent], ['税费', '企业所得税', model.taxes.corporateTax],
+    ['融资', '债务比例', model.finance.debtRatio], ['融资', '贷款利率', model.finance.loanRate], ['估值', '折现率', model.valuation.discountRate],
+    ['公式', '租金增长方式', formulas.rentGrowthMode], ['公式', '物业管理费增长方式', formulas.propertyFeeGrowthMode], ['公式', '商业管理费增长方式', formulas.commercialManagementGrowthMode], ['公式', '中央空调费增长方式', formulas.centralAcGrowthMode], ['公式', '建筑折旧年限', formulas.buildingDepreciationYears],
+    ['公式', '装修折旧年限', formulas.fitoutDepreciationYears], ['公式', '设备折旧年限', formulas.equipmentDepreciationYears],
+    ['公式', '亏损结转年限', formulas.taxLossCarryforwardYears], ['公式', '贷款还款方式', formulas.loanRepaymentMethod],
+    ['公式', '退出估值方法', formulas.exitValueMethod], ['公式', '退出收入倍数', formulas.exitRevenueMultiple],
+    ['人员', '单位社保公积金比例', model.organization?.socialInsuranceRate], ['人员', '个人社保公积金比例', model.organization?.employeeSocialInsuranceRate], ['人员', '年度薪资月数', model.organization?.annualSalaryMonths || 12],
+    ['人员', '个税起征点（元/月）', model.organization?.individualIncomeTaxThresholdMonthly ?? 5000], ['人员', '专项附加扣除（元/人/月）', model.organization?.specialAdditionalDeductionMonthly || 0],
+    ['人员', '税前年度工资（万元）', s.annualGrossPayroll || 0], ['人员', '个人社保公积金（万元）', s.annualEmployeeSocialInsurance || 0],
+    ['人员', '个人所得税（万元）', s.annualIndividualIncomeTax || 0], ['人员', '员工实发工资（万元）', s.annualNetPayroll || 0],
+    ['人员', '单位社保公积金（万元）', s.annualEmployerSocialInsurance || 0], ['人员', '实际人员及服务成本（万元）', s.stableStaffCost || 0],
+    ['人员', '人员成本来源', model.operations?.staffCostMode === 'area' ? '按面积快速估算' : '按组织架构薪资倒推'],
+    ['人员', '招聘培训费率', model.organization?.recruitmentTrainingRate], ['营销', '核算方式', model.marketingBudget?.amountMode === false ? '旧版权重（建议转换）' : '按金额录入，自动计算权重'],
+  ], [18, 28, 20]);
+  const buildingFloorRows = result.floors || [];
+  const buildingConfigs = normalizedBuildingChargeConfigs(model, result);
+  const buildingChargeWs = addSheet(wb, '楼栋收费设置', [
+    ['楼栋', '是否收取中央空调费', '中央空调费单价（元/㎡/月）', '计租面积（㎡）', '物业管理费（元/㎡/月）', '商业管理费（元/㎡/月）', '满租月物业费（元）', '满租月商管费（元）', '满租月空调费（元）', '满租月三项费用合计（元）', '说明'],
+    ...buildingConfigs.map(config => {
+      const rows = buildingFloorRows.filter(row => String(row.building || '1号楼') === String(config.building || ''));
+      const rentArea = rows.reduce((sum, row) => sum + Number(row.rentArea || 0), 0);
+      const monthlyProperty = rows.reduce((sum, row) => sum + Number(row.monthlyPropertyFee || 0), 0);
+      const monthlyCommercial = rows.reduce((sum, row) => sum + Number(row.monthlyCommercialManagementFee || 0), 0);
+      const monthlyCentral = rows.reduce((sum, row) => sum + Number(row.monthlyCentralAcFee || 0), 0);
+      const propertyRate = rentArea > 0 ? monthlyProperty / rentArea : 0;
+      const commercialRate = rentArea > 0 ? monthlyCommercial / rentArea : 0;
+      return [config.building || '1号楼', config.enabled ? '是' : '否', Number(config.fee || 0), roundArea(rentArea), propertyRate, commercialRate, monthlyProperty, monthlyCommercial, monthlyCentral, monthlyProperty + monthlyCommercial + monthlyCentral, config.enabled ? '中央空调费独立计入年度收益' : '不收取中央空调费；物业费和商管费照常计收'];
+    }),
+    [''],
+    ['计算说明', '满租月物业费=Σ(铺位计租面积×物业管理费单价)；满租月商管费=Σ(铺位计租面积×商业管理费单价)；满租月空调费=Σ(铺位计租面积×楼栋空调单价)。年度收益再乘出租率和对应递增因子。'],
+  ], [18, 24, 28, 18, 24, 24, 22, 22, 22, 26, 48]);
+  setSheetColumnNumberFormat(buildingChargeWs, [2, 3, 4, 5, 6, 7, 8, 9], '0.00');
+  const orgExportWs = addSheet(wb, '组织架构与人员成本', [
+    ['部门','岗位','编制人数','税前应发月薪（元/月）','社保缴费基数（元/月）','年度薪资月数','税前年度工资（万元）','个人社保公积金（万元）','个人所得税（万元）','实发工资（万元）','单位社保公积金（万元）','企业人员成本（万元）','岗位职责说明'],
+    ...(result.positionBreakdown || []).map(x => [x.department, x.name, x.headcount, x.avgMonthlySalary, x.socialInsuranceBaseMonthly ?? x.avgMonthlySalary, x.annualSalaryMonths || model.organization?.annualSalaryMonths || 12, x.grossPayroll, x.employeeSocialInsurance, x.individualIncomeTax, x.netSalary, x.employerSocialInsurance, x.annualCost, x.note]),
+    [''],
+    ['合计', '', s.stableHeadcount || 0, '', '', '', s.annualGrossPayroll || 0, s.annualEmployeeSocialInsurance || 0, s.annualIndividualIncomeTax || 0, s.annualNetPayroll || 0, s.annualEmployerSocialInsurance || 0, (s.annualGrossPayroll || 0) + (s.annualEmployerSocialInsurance || 0), '未含招聘培训费'],
+    ['实际人员及服务成本', '', '', '', '', '', '', '', '', '', '', s.stableStaffCost || 0, `含招聘培训及第三方物业服务管理费`],
+    [''],
+    ['口径说明', '岗位月薪为税前应发基本月薪；社保公积金按税前月薪作为月缴费基数×12个月估算；年度薪资月数只影响税前工资和应税所得。'],
+    ['风险提示', '单位/个人社保公积金比例、缴费基数上下限、个税专项附加扣除及适用政策须按项目属地最新规定和员工实际情况复核，默认值仅为测算参考。'],
+  ], [20, 20, 12, 24, 22, 14, 24, 24, 20, 20, 24, 24, 48]);
+  setSheetColumnNumberFormat(orgExportWs, [3, 4], '0.00');
+  setSheetColumnNumberFormat(orgExportWs, [6, 7, 8, 9, 10, 11], '0.00');
+  addSheet(wb, '个税税率表', [
+    ['中国居民个人综合所得年度税率表（测算参考）'],
+    ['年度应纳税所得额（元）', '税率', '速算扣除数（元）'],
+    ...CHINA_IIT_ANNUAL_BRACKETS,
+    [''],
+    ['计算公式', '个人所得税 = 年度应纳税所得额 × 适用税率 - 速算扣除数'],
+    ['年度应纳税所得额', '税前年度工资 - 个人社保公积金 - 个税起征点×12 - 专项附加扣除×12'],
+    ['当前个税起征点（元/月）', model.organization?.individualIncomeTaxThresholdMonthly ?? 5000],
+    ['当前专项附加扣除（元/人/月）', model.organization?.specialAdditionalDeductionMonthly || 0],
+    ['说明', '系统用于年度投资测算；正式申报应以累计预扣预缴和年度汇算结果为准。'],
+  ], [32, 18, 22]);
+  const propertyServiceWs = addSheet(wb, '物业服务模式', [
+    ['服务类别', '服务模式', '自动归类岗位', '编制人数', '岗位基础成本（万元）', '非驻场折算比例', '实际折算比例', '第三方综合管理费率', '折算后岗位成本（万元）', '第三方管理费（万元）', '自营招聘培训费（万元）', '年度服务成本（万元）'],
+    ...(result.propertyServiceBreakdown || []).map(item => [item.name, item.modeLabel, (item.positions || []).join('、'), item.headcount, item.basePositionCost, item.nonResidentFactor, item.positionFactor, item.managementFeeRate, item.positionCostAfterFactor, item.managementFee, item.selfRecruitmentTraining, item.serviceCost]),
+    [''],
+    ['合计', '', '', s.stableHeadcount || 0, s.annualServicePositionBaseCost || 0, '', '', '', '', s.annualOutsourcedManagementFee || 0, (result.propertyServiceBreakdown || []).reduce((sum, item) => sum + Number(item.selfRecruitmentTraining || 0), 0), s.annualPropertyServiceTotal || 0],
+    ['说明', '自营=岗位成本+自营招聘培训；第三方常驻=岗位成本×(1+综合管理费率)；第三方非常驻=岗位成本×非驻场折算比例×(1+综合管理费率)。'],
+  ], [20, 24, 48, 12, 24, 22, 18, 24, 26, 24, 26, 24]);
+  setSheetColumnNumberFormat(propertyServiceWs, [4, 8, 9, 10, 11], '0.00');
+  setSheetColumnNumberFormat(propertyServiceWs, [5, 6, 7], '0.00%');
+  setSheetColumnNumberFormat(propertyServiceWs, [3], '0');
+  const officeBudgetTotal = (result.officeBreakdown || []).reduce((sum, item) => sum + Number(item.value || 0), 0);
+  const leasingBudgetTotal = (result.leasingBreakdown || []).reduce((sum, item) => sum + Number(item.value || 0), 0);
+  const leasingPeriods = model.leasingBudget?.inputPeriods || {};
+  const leasingKeyByName = Object.fromEntries(LEASING_BUDGET_DEFS.map(([label, key]) => [label, key]));
+  const officeExportRows = (result.officeBreakdown || []).map(x => {
+    const period = x.period === 'monthly' ? '按月' : '按年';
+    return ['办公行政', x.name, '元', period, Number(x.value || 0) * 10000, Number(x.value || 0) * 10000 / 12, Number(x.value || 0) * 10000, officeBudgetTotal ? Number(x.value || 0) / officeBudgetTotal : 0, x.note || '页面和模板按元录入；导出统一折算为元'];
+  });
+  const leasingExportRows = (result.leasingBreakdown || []).map(x => {
+    const key = leasingKeyByName[x.name];
+    const formulaMode = key === 'channelFeeAnnual' && x.calculationMode === 'area_rent';
+    const period = formulaMode ? '面积公式' : leasingPeriods[key] === 'monthly' ? '按月' : '按年';
+    return ['招商费用', x.name, '万元', period, formulaMode || period === '按年' ? x.value : Number(x.value || 0) / 12, Number(x.value || 0) / 12, x.value, leasingBudgetTotal ? Number(x.value || 0) / leasingBudgetTotal : 0, formulaMode ? `渠道面积${Number(x.channelArea || 0).toFixed(2)}㎡；首年月租金${Number(x.rentPerSqmMonth || 0).toFixed(2)}元/㎡；${Number(x.commissionMonths || 0).toFixed(2)}倍` : ''];
+  });
+  const officeLeasingWs = addSheet(wb, '办公与招商预算', [
+    ['类别','费用项目','金额单位','录入周期','录入金额','月度金额','年度金额','自动权重','说明'],
+    ...officeExportRows,
+    ...leasingExportRows,
+  ], [16, 30, 12, 14, 18, 18, 18, 16, 64]);
+  setSheetColumnNumberFormat(officeLeasingWs, [4, 5, 6], '#,##0.00');
+  setSheetColumnNumberFormat(officeLeasingWs, [7], '0.00%');
+  addSheet(wb, '年度营销预算分解', [
+    ['常规年度营销预算'],
+    ['营销类别','年度金额（万元）','自动权重','费用内容'],
+    ...(result.marketingAllocation || []).map(x => [x.name, x.amount, x.share, x.note]),
+    ['常规年度合计', result.summary.annualMarketingBudget || 0, 1, '每年持续发生'],
+    [''],
+    ['开业首年专项营销'],
+    ['开业专项','首年金额（万元）','占首年营销总预算','费用内容'],
+    ...(result.openingMarketingAllocation || []).map(x => [x.name, x.amount, x.share, x.note]),
+    ['开业首年营销合计', result.summary.firstYearMarketingCost || 0, 1, `常规年度 + 开业专项`],
+  ], [24, 20, 20, 60]);
+  const operatingCostTotalForExport = (result.operatingCostBreakdown || []).reduce((sum, item) => sum + Number(item.value || 0), 0);
+  addSheet(wb, '运营成本构成', [
+    ['成本项目','年度金额（万元）','占运营成本、业主租金及税费比例'],
+    ...(result.operatingCostBreakdown || []).map(x => [x.name, x.value, operatingCostTotalForExport ? Number(x.value || 0) / operatingCostTotalForExport : 0])
+  ], [32, 20, 24]);
+  const phaseTotal = Number(s.fullCycleCostExcludingFinancing || 0);
+  addSheet(wb, '阶段成本汇总', [
+    ['阶段', '成本项目', '金额（万元）', '占全周期成本比例'],
+    ...(result.phaseCostBreakdown || []).map(x => [x.stage, x.name, x.value, phaseTotal ? Number(x.value || 0) / phaseTotal : 0]),
+    [''],
+    ['筹备期', '筹备期投入合计', s.preOpeningInvestment || 0, phaseTotal ? Number(s.preOpeningInvestment || 0) / phaseTotal : 0],
+    ['运营期', '运营期运营成本合计（含业主租金）', s.operationPeriodOperatingCost || 0, phaseTotal ? Number(s.operationPeriodOperatingCost || 0) / phaseTotal : 0],
+    ['运营期', '其中：运营成本（不含业主租金）', s.operationPeriodOperatingCostExOwnerRent || 0, phaseTotal ? Number(s.operationPeriodOperatingCostExOwnerRent || 0) / phaseTotal : 0],
+    ['运营期', '其中：业主租金', s.operationPeriodOwnerRent || 0, phaseTotal ? Number(s.operationPeriodOwnerRent || 0) / phaseTotal : 0],
+    ['运营期', '运营期税费合计', s.operationPeriodTaxes || 0, phaseTotal ? Number(s.operationPeriodTaxes || 0) / phaseTotal : 0],
+    ['全周期', '全周期成本（不含融资）', phaseTotal, 1],
+    ['融资', '运营期融资利息（参考）', s.operationPeriodInterest || 0, ''],
+    ['全周期', '含融资现金成本（参考）', s.fullCycleCashCostIncludingFinancing || 0, ''],
+  ], [16, 36, 22, 24]);
+  const taxWs = addSheet(wb, '税费与规费统计', [
+    ['税费与规费支出统计'],
+    ['稳定期出租率', s.stableTaxOccupancy || 0, '租金类税费基数已乘出租率；城镇土地使用税不乘出租率'],
+    ['项目', '稳定年（万元）', '月均（万元）', '运营期累计（万元）', '出租率联动'],
+    ['销项税', s.stableOutputVat || 0, (s.stableOutputVat || 0) / 12, s.operationPeriodOutputVat || 0, '是'],
+    ['可抵扣进项税', s.stableInputVat || 0, (s.stableInputVat || 0) / 12, s.operationPeriodInputVat || 0, '随可抵扣成本'],
+    ['其中：业主租金进项税', s.stableOwnerRentInputVat || 0, (s.stableOwnerRentInputVat || 0) / 12, s.operationPeriodOwnerRentInputVat || 0, '随租金和专票'],
+    ['其中：其他成本进项税', s.stableOtherInputVat || 0, (s.stableOtherInputVat || 0) / 12, s.operationPeriodOtherInputVat || 0, '随可抵扣成本'],
+    ['应纳增值税', s.stableVatPayable || 0, (s.stableVatPayable || 0) / 12, s.operationPeriodVatPayable || 0, '是'],
+    ['城建税及教育附加', s.stableVatSurcharge || 0, (s.stableVatSurcharge || 0) / 12, s.operationPeriodVatSurcharge || 0, '随增值税'],
+    ['房产税', s.stablePropertyTax || 0, (s.stablePropertyTax || 0) / 12, s.operationPeriodPropertyTax || 0, model.taxes?.propertyTaxMethod === 'value' ? '否' : '是'],
+    ['城镇土地使用税', s.stableLandUseTax || 0, (s.stableLandUseTax || 0) / 12, s.operationPeriodLandUseTax || 0, '否'],
+    ['印花税', s.stableStampDuty || 0, (s.stableStampDuty || 0) / 12, s.operationPeriodStampDuty || 0, '是'],
+    ['地方基金及附加', s.stableLocalFund || 0, (s.stableLocalFund || 0) / 12, s.operationPeriodLocalFund || 0, '是'],
+    ['计入NOI的经营税费', s.stableTaxes || 0, (s.stableTaxes || 0) / 12, s.operationPeriodTaxes || 0, '部分联动'],
+    ['企业所得税（融资前项目口径）', s.stableIncomeTax || 0, (s.stableIncomeTax || 0) / 12, s.operationPeriodIncomeTax || 0, '间接联动'],
+    ['企业所得税（融资后股权口径）', s.stableEquityIncomeTax || 0, (s.stableEquityIncomeTax || 0) / 12, s.operationPeriodEquityIncomeTax || 0, '随融资变化'],
+    ['税费现金支出合计', s.stableTaxCashOutflow || 0, (s.stableTaxCashOutflow || 0) / 12, s.operationPeriodTaxCashOutflow || 0, '—'],
+    [''],
+    ['年度税费明细'],
+    ['运营年', '日历年', '销项税', '进项税', '应纳增值税', '房产税', '土地使用税', '印花税', '附加税', '地方基金', '经营税费', '融资前项目所得税', '项目税费现金支出', '融资后股权所得税', '股权税费现金支出'],
+    ...(result.annual || []).filter(x => Number(x.opYear) > 0).map(x => [x.opYear, x.calendarYear, x.outputVat || 0, x.inputVat || 0, x.vatPayable || 0, x.propertyTax || 0, x.landUseTax || 0, x.stampDuty || 0, x.vatSurcharge || 0, x.localFund || 0, x.taxes || 0, x.projectIncomeTax || 0, x.taxCashOutflow || 0, x.equityIncomeTax || x.incomeTax || 0, x.equityTaxCashOutflow || 0]),
+  ], [28, 20, 20, 24, 20, 18, 18, 18, 18, 18, 20, 22, 22, 22, 22]);
+  setSheetColumnNumberFormat(taxWs, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], '0.00');
+  if (taxWs.B2) taxWs.B2.z = '0.00%';
+  const preBudget = model.preOpeningBudget || {};
+  if (preBudget.mode === 'detailed') {
+    const socialRate = Math.max(0, Number(preBudget.team?.socialInsuranceRate ?? 0.28));
+    const recruitmentRate = Math.max(0, Number(preBudget.team?.recruitmentTrainingRate ?? 0.02));
+    const preTeamRows = (preBudget.team?.positions || []).map(item => {
+      const headcount = Number(item.headcount || 0);
+      const salary = Number(item.monthlySalary || 0);
+      const months = Number(item.months || 0);
+      const gross = headcount * salary * months / 10000;
+      const social = headcount * salary * months * socialRate / 10000;
+      const training = (gross + social) * recruitmentRate;
+      return [item.department || '', item.position || '', headcount, salary, months, gross, social, training, gross + social + training, item.note || ''];
+    });
+    const prePropertyDetails = (preBudget.property?.services || []).map(item => {
+      const months = Number(item.months || 0);
+      const factor = Number(item.nonResidentFactor ?? 0.7);
+      const feeRate = Number(item.managementFeeRate ?? 0.12);
+      const positions = (Array.isArray(item.positions) && item.positions.length ? item.positions : [{ name: `${item.name || '物业服务'}岗位`, headcount: item.headcount, monthlySalary: item.monthlySalary }]).map(position => {
+        const headcount = Number(position.headcount || 0);
+        const salary = Number(position.monthlySalary || 0);
+        const companyCost = headcount * salary * months * (1 + socialRate) / 10000;
+        return { ...position, headcount, salary, companyCost };
+      });
+      const headcount = positions.reduce((sum, position) => sum + position.headcount, 0);
+      const salary = headcount > 0 ? positions.reduce((sum, position) => sum + position.headcount * position.salary, 0) / headcount : 0;
+      const base = positions.reduce((sum, position) => sum + position.companyCost, 0);
+      const positionCost = item.mode === 'non_resident' ? base * factor : base;
+      const managementFee = ['resident_outsourced', 'non_resident'].includes(item.mode) ? positionCost * feeRate : 0;
+      const selfTraining = item.mode === 'self' ? positionCost * Number(preBudget.property?.selfRecruitmentRate ?? 0.02) : 0;
+      return { ...item, positions, headcount, salary, months, factor, feeRate, total: positionCost + managementFee + selfTraining };
+    });
+    const prePropertyRows = prePropertyDetails.map(item => [item.name || '', PROPERTY_SERVICE_MODE_LABELS[item.mode] || item.mode || '', item.headcount, item.salary, item.months, item.factor, item.feeRate, item.total]);
+    const prePropertyPositionRows = prePropertyDetails.flatMap(item => item.positions.map(position => [item.name || '', position.name || '', position.headcount, position.salary, position.companyCost, position.note || '']));
+    const preAdminRows = (preBudget.admin?.items || []).map(item => {
+      const amount = Number(item.amount || 0);
+      const months = Number(item.months || 0);
+      return [item.name || '', amount, item.period === 'monthly' ? '每月' : '一次性总额', months, item.period === 'monthly' ? amount * months / 10000 : amount / 10000, item.note || ''];
+    });
+    const preOneOffRows = (preBudget.property?.oneOffItems || []).map(item => [item.name || '', Number(item.amount || 0)]);
+    const preTeamTotal = preTeamRows.reduce((sum, row) => sum + Number(row[8] || 0), 0);
+    const prePropertyServiceTotal = prePropertyRows.reduce((sum, row) => sum + Number(row[7] || 0), 0);
+    const preOneOffTotal = preOneOffRows.reduce((sum, row) => sum + Number(row[1] || 0), 0);
+    const preAdminTotal = preAdminRows.reduce((sum, row) => sum + Number(row[4] || 0), 0);
+    const preWs = addSheet(wb, '筹备期成本明细', [
+      ['筹备期成本明细预算'],
+      ['单位社保公积金比例', socialRate, '招聘培训费率', recruitmentRate],
+      ['筹备团队合计（万元）', preTeamTotal, '筹备物业合计（万元）', prePropertyServiceTotal + preOneOffTotal, '行政开办合计（万元）', preAdminTotal],
+      [''],
+      ['一、筹备团队人力资源'],
+      ['部门', '岗位', '编制', '税前月薪（元/月）', '筹备月数', '税前工资（万元）', '单位社保（万元）', '招聘培训（万元）', '合计（万元）', '说明'],
+      ...preTeamRows,
+      ['团队合计', '', '', '', '', '', '', '', preTeamTotal, ''],
+      [''],
+      ['二、筹备期物业工程、保安、保洁'],
+      ['服务类别', '服务模式', '编制', '加权月薪（元/月）', '服务月数', '非驻场折算', '综合管理费率', '服务成本（万元）'],
+      ...prePropertyRows,
+      ['物业服务小计', '', '', '', '', '', '', prePropertyServiceTotal],
+      [''],
+      ['物业服务岗位明细'],
+      ['服务类别', '岗位', '编制', '参考月薪（元/月）', '岗位工资+单位社保（万元）', '岗位说明'],
+      ...prePropertyPositionRows,
+      [''],
+      ['物业一次性费用', '金额（万元）'],
+      ...preOneOffRows,
+      ['一次性费用小计', preOneOffTotal],
+      ['物业合计', prePropertyServiceTotal + preOneOffTotal],
+      [''],
+      ['三、行政办公及开办费用'],
+      ['费用科目', '金额（元）', '金额口径', '月数', '核算金额（万元）', '说明'],
+      ...preAdminRows,
+      ['行政开办合计', '', '', '', preAdminTotal, ''],
+      [''],
+      ['重要说明', '本表为筹备期明细预算，应与合同、招聘计划、物业方案和行政开办清单交叉核对。'],
+    ], [24, 22, 14, 24, 14, 20, 20, 20, 20, 56]);
+    setSheetColumnNumberFormat(preWs, [3, 5, 6, 7, 8, 15, 20], '0.00');
+    setSheetColumnNumberFormat(preWs, [4, 6, 7], '0.00%');
+  }
+  addSheet(wb, '资金计划', [
+    ['资金需求与阶段现金流'],
+    ['建议启动资金（万元）', s.recommendedStartupCapital || 0],
+    ['项目资金缺口峰值（万元）', s.peakProjectFundingRequirement || 0],
+    ['项目缺口峰值日期', s.peakProjectFundingDate || '未识别'],
+    ['资本金缺口峰值（万元）', s.peakEquityFundingRequirement || 0],
+    ['资本金缺口峰值日期', s.peakEquityFundingDate || '未识别'],
+    ['累计现金流转正月份', s.cashFlowBreakEvenMonth || '未在月度计划内转正'],
+    ['累计现金流转正日期', s.cashFlowBreakEvenDate || '未在月度计划内转正'],
+    ['累计现金流转正年份', s.cashFlowBreakEvenYear || '未在测算期内转正'],
+    ['商管进场日期', s.managementStartDate || '未识别'],
+    ['商管进场月度成本（万元/月）', s.managementMonthlyCost || 0],
+    ['招商启动预计收取租赁保证金（万元）', s.merchantDepositCashInflow || 0],
+    ['招商启动预计收取预付租金（万元）', s.merchantPrepaidRentCashInflow || 0],
+    ['常态化运营资金需求（万元）', s.normalOperationCapital || 0],
+    ['常态化运营周转资金（月均支出×安全垫，万元）', s.normalOperationWorkingCapital || 0],
+    ['稳定期月经营及税费成本（万元/月）', s.stableMonthlyOperatingCost || 0],
+    ['稳定期月还本付息（万元/月）', s.stableMonthlyDebtService || 0],
+    ['稳定期月资本性支出预留（万元/月）', s.stableMonthlyCapexReserve || 0],
+    ['稳定期月经营现金流入（万元/月）', s.stableMonthlyCashInflow || 0],
+    ['稳定期月净现金流（万元/月）', s.stableMonthlyNetCashFlow || 0],
+    ['自有资本金（万元）', s.equityCapital || 0],
+    ['债务融资（万元）', s.loanAmount || 0],
+    ['杠杆倍数', s.leverageMultiple || 0],
+    ['项目净现金收益（万元）', s.projectNetCashProfit || 0],
+    ['项目盈利合计（全周期现金流，万元）', s.projectProfitTotal ?? s.projectNetCashProfit ?? 0],
+    ['稳定年商业及运营管理成本（不含业主租金，万元）', s.stableCommercialManagementCost || 0],
+    ['稳定年扣除商业管理成本后经营结余（万元）', s.stableCommercialOperatingBalance || 0],
+    ['运营期商业及运营管理成本累计（万元）', s.periodCommercialManagementCost || 0],
+    ['运营期扣除商业管理成本后经营结余累计（万元）', s.periodCommercialOperatingBalance || 0],
+    ['原始建设投资（万元）', s.hardInvestment || 0],
+    ['招商运营启动投入（万元）', s.softPreopeningInvestment || 0],
+    ['运营现金回收（万元）', s.capitalRecoveredByOperation || 0],
+    ['原始投入回收率', s.initialInvestmentRecoveryRate || 0],
+    ['未回收原始投入（万元）', s.unrecoveredInitialInvestment || 0],
+    ['原始投入是否全部回收', s.initialInvestmentFullyRecovered ? '是' : '否'],
+    ['资本金净收益（万元）', s.equityNetCashProfit || 0],
+    ['周期净利润（万元）', s.periodNetProfit || 0],
+    ['周期净利率', s.periodProfitMargin || 0],
+    ['期末退出价值（万元）', s.exitValueIncluded ? (s.exitValue || 0) : 0],
+    ['期末退出价值口径', s.exitValueIncluded ? '已计入最后一年现金流' : (s.exitValueBlockedReason || '不计入')],
+    ['资本金回报倍数', s.equityReturnMultiple || 0],
+    ['资本金净收益率', s.equityProfitRate || 0],
+    ['股权IRR', s.equityIrr == null ? '不适用' : s.equityIrr],
+    [''],
+    ['分阶段资金需求'],
+    ['阶段', '项目口径需准备（万元）', '资本金口径需准备（万元）', '阶段项目净现金流（万元）', '阶段资本金净现金流（万元）'],
+    ...(result.phaseFundingRequirements || []).filter(x => ['建设期', '筹备招商期', '开业首年'].includes(x.phase)).map(x => [x.phase, x.projectFundingNeed, x.equityFundingNeed, x.projectCashFlow, x.equityCashFlow]),
+    [''],
+    ['阶段', '项目净现金流（万元）', '资本金净现金流（万元）'],
+    ...(result.phaseCashFlowSummary || []).map(x => [x.phase, x.projectCashFlow, x.equityCashFlow]),
+    [''],
+    ['月份', '月份起始日', '关键事件日期', '阶段', '商户经营流入（万元）', '招商签约流入（万元）', '其中：租赁保证金（万元）', '其中：预付租金（万元）', '经营及税费支出（不含业主租金，万元）', '其中：商管进场成本（万元）', '业主租金（万元）', '建设/筹备支出（万元）', '融资流入（万元）', '还本付息（万元）', '项目净现金流（万元）', '项目累计现金流（万元）', '资本金净现金流（万元）', '资本金累计/缺口（万元）'],
+    ...(result.monthlyFundingPlan || []).map(x => {
+      const depositInflow = Number(x.tenantDepositInflow || 0);
+      const prepaidRentInflow = Number(x.prepaidRentInflow || 0);
+      const operatingIn = Math.max(0, Number(x.operatingInflow || 0) - prepaidRentInflow);
+      const operatingOut = Number(x.operatingOutflow || 0) + Number(x.depositOutflow || 0) + Number(x.taxOutflow || 0);
+      const debtService = Number(x.loanInterest || 0) + Number(x.loanPrincipal || 0);
+      return [x.month, x.date || '', (x.eventDates || []).join('、'), x.phase, operatingIn, depositInflow + prepaidRentInflow, depositInflow, prepaidRentInflow, operatingOut, x.preopeningManagementOutflow || 0, x.ownerRentOutflow || 0, x.capexOutflow || 0, x.loanDraw || 0, debtService, x.projectCashFlow, x.cumulativeProjectCashFlow, x.equityCashFlow, x.cumulativeEquityCashFlow];
+    }),
+  ], [14, 18, 34, 24, 22, 24, 26, 24, 30, 26, 18, 26, 22, 22, 26, 28, 28, 30]);
+  addSheet(wb, '资金用途明细', [
+    ['资金阶段', '用途项目', '说明', '金额（万元）'],
+    ...(result.fundingUseBreakdown || []).map(x => [x.phase, x.item, x.note, x.amount]),
+    [''],
+    ['资金来源', '说明', '金额（万元）'],
+    ...(result.fundingSourceBreakdown || []).map(x => [x.item, x.note, x.amount]),
+  ], [20, 30, 70, 20]);
+  const formulaRows = [
+    ['面积', '总建筑面积', '手动总建筑面积；若为0：一铺一价=商铺建筑面积合计×(1+公区系数)，初步测算=楼层建筑面积合计', ['IF','SUM'], '先判断是否手动填写总建筑面积；没有则按商铺面积和公区系数推算；结果进入建设投资和单位投资指标计算。', '优先填规划面积或测绘面积；没有时用商铺面积反推。调整公区系数后观察总投资和单位投资变化。', 'project.commonAreaFactor', model.project.commonAreaFactor, '公区系数增加会同步增加建安、装修、设备和规费。'],
+    ['租金', '有效出租率', 'IF(运营年=1,首年最低出租率,IF(运营年<稳定年,第二年出租率,稳定出租率))', ['IF'], '按运营年份选择出租率：首年最低出租率、第二年出租率或稳定期出租率；再乘租金、物业费和停车收入。', '首年、第二年和稳定期出租率均按页面录入值核算；开业前最后招商目标仅用于核对参考。', 'operations.occupancyY1', model.operations.occupancyY1, '首年最低出租率影响首年现金流和招商佣金。'],
+    ['租金', '租金递增因子', '不递增=1；每年复利=(1+年递增率)^(运营年-1)；每年单利=1+年递增率×(运营年-1)；每N年阶梯=(1+阶梯递增率)^INT((运营年-1)÷N)', ['POWER','INT','IF'], '按所选模式逐年计算租金增长因子，再乘首年满租租金。阶梯模式只在每个N年周期到达时上调。', '有租约递增条款时按条款设置，例如“每3年递增5%”选择阶梯模式并填周期3、递增率5%。租金与销售扣点增长分开管理。', 'formulas.rentGrowthMode', formulas.rentGrowthMode, '增长方式会显著影响后期NOI和退出价值。'],
+    ['租金', '阶段性招商调整', '阶段租金因子=基础年度递增因子×(1+阶段租金调整率)；阶段有效出租率=IF(目标出租率>0,目标出租率,原出租率)；阶段招商成本仅在起始年计入', ['IF','POWER','INT','SUM'], '在正常年度递增之外，按阶段叠加品牌升级、业态优化或换租后的租金调整，并可设置阶段目标出租率和一次性招商成本。', '建议每3–5年设置一次阶段，起止年连续但不重叠。正数上调、负数下调；一次性招商成本按实际预算填写。', 'operations.leasingAdjustmentPeriods', '按阶段设置', '阶段租金和出租率影响NOI、现金流、IRR和NPV；阶段招商成本影响起始年利润。'],
+    ['租金', '首年免租调整', '首年租金×出租率×(1-免租月数÷12)', ['IF','SUM'], '首年免租系数将免租月数换算成年化扣减比例，只影响首年租金收入。', '按实际免租期和装修期填写；免租越长，首年现金流越低，但不改变合同单价。', 'operations.rentFreeMonths', model.operations.rentFreeMonths, '仅影响首年收入及现金流的低点。'],
+    ['联营', '保底与扣点取高', 'IF(纯租金,保底,IF(纯扣点,扣点,MAX(保底,扣点)))', ['IF','MAX'], '先按项目或业态选择结算方式；取高模式逐铺比较保底收入和扣点收入，选较高者。', '百货和奥特莱斯常用取高模式；纯租金项目不要重复叠加扣点。先核对每种业态的扣点率和销售基数。', 'project.revenueModel', model.project.revenueModel, '结算方式改变会直接改变租金收入和租户风险分担。'],
+    ['投资', '分项工程投资', '总建筑面积×分项单价÷10000', ['SUM','ROUND'], '将前期、建安、装修、设备和其他工程分别按面积乘单价，再汇总为直接工程费。', '以目标成本、造价咨询或合同金额为准。先调建安和装修，再调其他工程；每次调整后查看总投资和NPV。', 'costs.constructionRate', model.costs.constructionRate, '建安单价是最主要的投资敏感项。'],
+    ['投资', '预备费', '直接工程费×预备费费率', ['SUM'], '直接工程费汇总后乘预备费费率，作为不可预见费用。', '通常3%–8%；方案深度越浅、建设风险越高，预备费应越充分。', 'project.contingencyRate', model.project.contingencyRate, '预备费增加会提高总投资和折旧基数。'],
+    ['投资', '铺底流动资金', '稳定运营成本估算×铺底比例', ['SUM','MAX'], '先估算稳定期物业、能耗、商管、行政和维修成本，再乘铺底比例。', '按运营资金周转需求设置；通常3%左右，招商爬坡慢时可适当提高。', 'costs.workingCapitalRate', model.costs.workingCapitalRate, '流动资金属于总投资但不形成长期资产。'],
+    ['阶段成本', '筹备期与运营期成本', '筹备期投入=项目总投资；运营期成本=Σ[运营成本（不含业主租金）+业主租金+税费]；全周期成本（不含融资）=筹备期投入+运营期成本', ['SUM'], '按项目推进阶段分别汇总，业主租金单列后与运营成本、税费共同构成运营期成本。', '核对筹备期工程和开办费是否完整，再检查运营期人员、物业、招商、营销、维保、业主租金和税费；融资利息单独列示。', 'project.operationYears', model.project.operationYears, '用于判断投资峰值、运营成本、业主租金和全周期现金流压力。'],
+    ['收入', '物业管理费收入', 'Σ铺位计租面积×物业管理费单价×12×出租率×物业费递增因子÷10000', ['SUM','POWER','INT','IF'], '所有铺位统一使用项目信息表录入的物业管理费单价，再按物业费独立递增模式逐年调整。', '按物业服务合同设置唯一执行单价与递增周期，与商业管理费和空调费分开核对。', 'formulas.propertyFeeGrowthMode', formulas.propertyFeeGrowthMode, '物业费递增会提高后期收入、销项税和NOI。'],
+    ['收入', '商业管理费收入', 'Σ铺位计租面积×商业管理费单价×12×出租率×商管费递增因子÷10000', ['SUM','POWER','INT','IF'], '所有铺位统一使用项目信息表录入的商业管理费单价，再按商管费独立递增模式逐年调整。', '按商业管理委托合同设置唯一执行单价与递增周期；如项目不收商管费则填0。', 'formulas.commercialManagementGrowthMode', formulas.commercialManagementGrowthMode, '商管费独立增加服务性收入，并单独计算增值税。'],
+    ['收入', '中央空调使用费收入', 'Σ开启楼栋的铺位计租面积×楼栋空调单价×12×出租率×空调费递增因子÷10000', ['SUM','POWER','INT','IF'], '按楼栋开关判断是否收费，所有铺位统一使用该楼栋录入的空调单价；未开启楼栋按0核算。', '先梳理哪些楼栋实际提供中央空调并收费，再按能源、运维成本和合同调整楼栋单价及递增率。', 'formulas.centralAcGrowthMode', formulas.centralAcGrowthMode, '空调费为独立收入来源，不计入物业费或商业管理费。'],
+    ['收入', '多经与停车收入', '租金×多经比例+车位数×月租×12×出租率÷10000', ['SUM'], '多经收入按租金比例计算，停车收入按车位数量和月租计算，两者相加进入营业收入。', '按广告、场地、临时点位和停车收费方案调整；没有数据时可保守设置为0。', 'revenues.otherIncomeRatio', model.revenues.otherIncomeRatio, '属于其他收入，需单独计算增值税。'],
+    ['运营', '运营成本与业主租金', '运营成本（不含业主租金）=物业+能耗+商管+行政+营销+维修+保险+坏账+其他；运营成本合计=运营成本（不含业主租金）+业主租金', ['SUM','MIN'], '各成本分项按面积、收入或资产原值计算，汇总后扣减可抵扣进项税；业主租金单列后共同进入NOI。', '按运营预算和物业合同调整。先核对人员编制、能耗和维保，再调营销、其他费用和业主租金。', 'operations.propertyOpsCost', model.operations.propertyOpsCost, '运营成本和业主租金均直接扣减NOI。'],
+    ['运营', '年度招商及运营成本调整', '当年招商费用=基准×招商系数+额外额；常规运营成本=基准×运营系数+年度额外成本', ['IF','SUM'], '系统按运营年度读取设置，对招商费用和常规运营成本分别应用系数，并叠加额外成本。', '在年度调整表中按年份填写；100%表示不调整，超过100%表示增加，低于100%表示压缩。', 'operations.annualCostAdjustments', '按年设置', '用于体现开业爬坡、招商计划、团队扩编或成本优化。'],
+    ['成本', '业主租金（土地及物业）', '按面积：面积×元/㎡/月÷10000；按总额：直接取月租金；再乘支付月数并按合同递增', ['SUM','IF','POWER'], '土地和物业分别选择按面积单价或月度总额计价，形成月度租金后乘以支付月数，再按所选递增方式逐年计算。', '分别核对土地合同和物业合同的计价方式、面积、单价或月租金总额、支付月数、递增方式和递增率，并检查免租期和解约条款。', 'ownerRent.propertyMonthlyRent', model.ownerRent?.propertyMonthlyRent || 0, '业主租金作为独立成本项，与运营成本分列，但同样扣减NOI并进入现金流。'],
+    ['税费', '销项税与进项税', '销项=Σ[含税收入÷(1+税率)×税率]；进项=MIN(销项,可抵扣成本×比例×税率÷(1+税率))', ['SUM','MIN'], '先按租金、物业、其他收入和联营扣点分别计算销项税，再估算可抵扣进项税，差额形成增值税净额。', '税率和抵扣比例按项目属地、合同类型和税务认定设置；不能直接套用全国统一值。', 'taxes.vatRent', model.taxes.vatRent, '增值税净额影响附加税和现金流。'],
+    ['税费', '房产税', 'IF(从租,不含税租金×12%,房产原值×(1-扣除比例)×1.2%)', ['IF'], '根据从租或从价方式选择公式；从租按不含税租金，从价按房产余值。', '先确认税务认定的计征方式；从租和从价结果差异较大，不能同时使用。', 'taxes.propertyTaxMethod', model.taxes.propertyTaxMethod, '房产税是商业地产重要持有税。'],
+    ['税费', '土地使用税', '占地面积×单位税额÷10000', ['ROUND'], '按项目占地面积和土地等级对应单位税额计算，金额换算为万元。', '按项目所在地最新土地等级和税额标准填写；不同地块可能适用不同税额。', 'taxes.landUseTax', model.taxes.landUseTax, '属于年度固定税费。'],
+    ['税费', '企业所得税（融资前/融资后）', '融资前项目所得税=MAX(0,EBIT-项目可结转亏损)×税率；融资后股权所得税=MAX(0,EBIT-利息-可结转亏损)×税率', ['MAX','IF'], '项目口径不含融资利息抵税，与项目IRR/NPV一致；股权口径扣除融资利息，与股权现金流和股权IRR一致。两者分别计算亏损结转。', '所得税率按适用税法填写；亏损结转年限及税务口径应与财务顾问确认，不要把融资前和融资后所得税混用。', 'taxes.corporateTax', model.taxes.corporateTax, '项目所得税影响项目现金流、IRR和NPV；股权所得税影响净利润和股权IRR。'],
+    ['融资', '贷款额与利息', '贷款额=总投资×债务比例；利息=(期初余额+当年提款÷2)×年利率', ['SUM'], '先按总投资和债务比例确定贷款额，再按建设期提款和期初余额计算每年利息。', '按融资方案调整债务比例、利率和提款节奏；提高杠杆可能提高股权IRR，但增加偿债压力。', 'finance.debtRatio', model.finance.debtRatio, '影响股权投入、利息和股权现金流。'],
+    ['融资', '还款方式', '等额本金：贷款额÷期限；先息后本：期末一次还本', ['IF'], '等额本金在宽限期后逐年偿还本金；先息后本在贷款期末一次性偿还本金。', '按融资合同设置；先息后本前期现金流压力小，但期末还本压力集中。', 'formulas.loanRepaymentMethod', formulas.loanRepaymentMethod, '影响本金流出年度分布。'],
+    ['折旧', '年折旧', '建筑投资÷建筑年限+装修投资÷装修年限+设备投资÷设备年限', ['SUM'], '三类资产分别按各自年限直线折旧，再合计为年度折旧。', '折旧年限按会计政策、税法规定和资产寿命设置；折旧不是现金支出，但会影响所得税。', 'formulas.buildingDepreciationYears', formulas.buildingDepreciationYears, '折旧变化影响税前利润、所得税和净利润。'],
+    ['退出', 'NOI资本化率法', '期末NOI÷退出资本化率×(1-退出税费率)', ['MAX','IF'], '用期末稳定NOI除以资本化率得到毛退出价值，再扣退出税费。', '资本化率按同类资产成交和估值判断；资本化率上升会降低退出价值。', 'valuation.exitCapRate', model.valuation.exitCapRate, '影响最后一年现金流、NPV和IRR。'],
+    ['退出', '收入倍数法', '期末营业收入×退出收入倍数×(1-退出税费率)', ['SUM','IF'], '用期末营业收入乘退出倍数得到退出价值，再扣退出税费。', '收入倍数应保守，并与NOI资本化率法交叉验证；不要只用较高方法支撑投资结论。', 'formulas.exitRevenueMultiple', formulas.exitRevenueMultiple, '影响期末退出价值和项目NPV。'],
+    ['收益', 'NPV', 'Σ[CFt÷(1+r)^t]', ['NPV','POWER','SUM'], '把每年项目现金流按折现率折到当前时点后相加；建设期现金流出也纳入。', '折现率采用企业投资门槛或同类项目资本成本；NPV大于0才表示达到门槛。', 'valuation.discountRate', model.valuation.discountRate, 'NPV是项目可行性判断的核心指标。'],
+    ['收益', '项目盈利合计', '项目盈利合计=Σ[全周期项目收入+期末退出价值-建设投资-商业管理启动成本-运营成本-业主租金-税费-项目所得税]', ['SUM','IF'], '项目盈利合计采用全周期现金口径，已扣除项目原始建设投入、商管启动成本和运营期成本税费。', '非自有产权项目期末退出价值为0；项目盈利合计与周期净利润并行查看，前者看现金盈利，后者看会计利润。', 'valuation.includeExit', model.valuation.includeExit, '项目盈利合计直接反映项目全周期最终盈利。'],
+    ['收益', 'IRR', '求使NPV(IRR)=0的折现率', ['IRR','二分法'], '系统在合理区间内反复二分，寻找让NPV等于0的折现率。', 'IRR高于企业门槛才通过初筛；现金流异常时IRR可能无解，应结合NPV。', 'valuation.discountRate', model.valuation.discountRate, '用于比较项目自身收益能力。'],
+    ['收益', '静态回收期', '累计现金流由负转正的插值年份', ['LOOKUP','IF'], '逐年累计现金流，找到由负转正的年份，并按当年现金流比例插值。', '回收期越短，资金占用风险越低；可与融资期限和退出计划对照。', 'project.operationYears', model.project.operationYears, '用于判断投资回收速度。'],
+    ['人员', '税前年度工资与社保', '税前年度工资=Σ(人数×税前应发月薪×年度薪资月数)；个人社保=Σ(税前月薪×12×个人比例)；单位社保=Σ(税前月薪×12×单位比例)', ['SUM'], '岗位月薪按税前应发口径录入。年度多薪增加税前工资；社保公积金按每月缴费基数缴纳12个月，不随13/15薪重复增加缴费月数。', '按定编定岗方案填写人数和税前应发月薪；年度薪资月数可填12、13、14或15薪。单位和个人社保公积金比例必须按项目属地险种、基数和年度政策调整，不能直接套用默认值。', 'organization.employeeSocialInsuranceRate', model.organization?.employeeSocialInsuranceRate, '决定税前工资、员工实发和企业人员成本。'],
+    ['人员', '个人所得税与实发工资', '年度应纳税所得额=税前年度工资-个人社保公积金-5000×12-专项附加扣除×12；个税=应纳税所得额×税率-速算扣除数；实发=税前工资-个人社保-个税', ['MAX','IF'], '采用中国居民个人综合所得七级年度超额累进税率：3%、10%、20%、25%、30%、35%、45%，并减去对应速算扣除数。', '核对个税起征点、专项附加扣除和年度薪资结构。系统按年度总额估算，正式申报应采用累计预扣预缴和年度汇算结果。', 'organization.individualIncomeTaxThresholdMonthly', model.organization?.individualIncomeTaxThresholdMonthly ?? 5000, '影响员工个人所得税和实发工资，不直接改变企业现金工资总额。'],
+    ['人员', '企业人员成本及招聘培训', '企业人员成本=税前年度工资+单位社保公积金；含招聘培训成本=企业人员成本×(1+招聘培训费率)', ['SUM','IF'], '企业实际承担的是税前工资、单位社保公积金，以及另计的招聘培训支出；个人社保和个税从员工税前工资中代扣，不重复增加企业成本。', '将组织架构倒推的企业人员成本与属地薪酬水平、招聘计划和培训预算交叉核对。', 'organization.recruitmentTrainingRate', model.organization?.recruitmentTrainingRate, '企业人员成本直接进入年度运营成本和NOI。'],
+    ['物业', '物业服务模式与第三方管理费', '自营=岗位基础成本+自营招聘培训；第三方常驻=岗位基础成本×(1+综合管理费率)；第三方非常驻=岗位基础成本×非驻场折算比例×(1+综合管理费率)', ['IF','SUM','MIN'], '系统先按部门/岗位自动归集物业工程、保安、保洁岗位，以岗位工资和单位社保成本为基础，再按服务模式增加招聘培训费或第三方综合管理费。', '自营适合直接管理团队；第三方常驻适合稳定驻场服务；非常驻适合巡检和专项服务。第三方综合管理费率应按合同覆盖管理费、利润、保险、装备、培训及税费。', 'propertyService.security.managementFeeRate', model.propertyService?.security?.managementFeeRate, '服务模式直接影响人员与服务成本、NOI、NPV和IRR。'],
+    ['人员', '人员成本来源', '按组织架构=Σ企业人员成本+招聘培训费；按面积=总建筑面积×人员成本单价×12', ['IF','SUM'], '选择组织架构模式后，管理团队及物业人员成本由HR薪资明细倒推。', '前期可用面积快速估算，招商运营阶段应使用组织架构薪资成本。', 'operations.staffCostMode', model.operations?.staffCostMode || 'organization', '决定管理团队人员成本采用薪资倒推还是面积估算。'],
+    ['成本录入', '年度与月度金额换算', '按年录入：月度金额=录入金额÷12；年度金额=录入金额。按月录入：年度金额=录入金额×12；月度金额=录入金额', ['IF','SUM'], '办公预算和招商预算可逐项选择年度或月度录入，系统统一转成年化金额参与NOI和现金流。', '同一张表可混合年度和月度录入。切换周期只换算显示口径，不改变年化金额；重新输入金额后才会改变年化值。', 'officeBudget.inputPeriods', '逐项设置', '影响运营成本、NOI、NPV和IRR。'],
+    ['招商', '渠道面积与首年月租金佣金', '渠道招商面积=项目总建筑面积×渠道面积比例；渠道及代理费=渠道招商面积×渠道租金单价×月租金倍数÷10000', ['IF','SUM'], '例如项目总建筑面积2,000㎡、渠道比例50%，渠道面积为1,000㎡；再乘渠道租金单价和佣金月数。', '渠道面积比例按实际招商委托范围设置；渠道租金单价默认带出项目当前租金单价，可人工改写或恢复默认。首开招商佣金已在投资中单列，如为同一合同避免重复计入。', 'leasingBudget.channelCalculationMode', model.leasingBudget?.channelCalculationMode, '渠道佣金会直接增加年度招商费用和运营成本。'],
+    ['办公', '年度办公行政成本', '租金+水电通讯+IT软件+办公用品+差旅招待+其他', ['SUM'], '逐项汇总年度办公行政预算。', '按行政预算和已签合同调整；办公室租金、IT服务和差旅标准应与团队规模匹配。', 'officeBudget.officeRentAnnual', model.officeBudget?.officeRentAnnual, '办公成本直接扣减NOI。'],
+    ['招商', '年度招商费用', '渠道代理+活动+物料+差旅+平台+其他；续租佣金按周期另计', ['SUM','MOD','IF'], '年度固定招商预算与续租佣金分开计算，避免重复。', '按招商策略和渠道政策填写；首开佣金、年度招商费用和续租佣金分别管理。', 'leasingBudget.channelFeeAnnual', model.leasingBudget?.channelFeeAnnual, '招商费用直接扣减运营现金流。'],
+    ['营销', '年度营销金额与自动权重', '常规年度=营销推广+商业美陈+媒体宣传+会员营销；首年=常规年度+导视导览+开业美陈；自动权重=单项金额÷对应合计', ['SUM','IF'], '营销费用全部由用户按金额录入，系统不再按权重倒推预算。常规四项每年发生，开业两项只在运营第1年计入。', '直接按年度推广计划、合同和报价填写金额。权重用于检查结构，不需要手工调整；某项金额变化后，合计、占比、NOI和现金流会自动重算。', 'marketingBudget.annualItems', '按金额录入', '营销费用直接扣减NOI；开业专项只影响首年现金流。'],
+    ['维保', '年度维保费用', '资产原值×维修费率+电梯+暖通+消防+景观+其他专项维保', ['SUM'], '日常维修按费率计提，专项维保按年度合同金额单列，两者相加。', '维修费率通常按资产原值0.5%–2%；专项维保按合同和年检要求填写。', 'maintenanceBudget.elevatorAnnual', model.maintenanceBudget?.elevatorAnnual, '维保成本直接扣减NOI。'],
+    ['敏感性', 'NPV敏感性矩阵', 'NPV=f(租金系数,投资系数)，按MIN~MAX和STEP生成', ['SEQUENCE','NPV'], '分别改变租金和投资系数，逐个重新计算项目NPV，形成矩阵。', '上下限覆盖悲观和乐观情景，通常从±10%开始，步长5%；重点观察NPV由负转正的临界点。', 'formulas.sensitivityRentMin', formulas.sensitivityRentMin, '用于识别项目最敏感的假设。'],
+  ];
+  addSheet(wb, '公式与参数', [
+    ['模块','公式名称','公式表达式','使用函数','函数注解','计算逻辑','调整建议','参数路径','当前值','参数影响'],
+    ...formulaRows.map(row => [row[0],row[1],row[2],row[3].join(' / '),exportFunctionDescription(row[3]),row[4],row[5],row[6],row[7],row[8]])
+  ], [14, 22, 68, 22, 60, 70, 70, 34, 18, 48]);
+  addSheet(wb, '函数注解', [
+    ['函数','语法','含义','项目示例','调整注意事项'],
+    ...Object.entries(EXPORT_FUNCTIONS).map(([name, f]) => [name, f.syntax, f.meaning, f.example, f.note])
+  ], [16, 38, 55, 55, 70]);
+  addSheet(wb, '投资构成', [['项目', '金额（万元）', '占比'], ...result.investmentBreakdown.map(x => [x.name, x.value, s.totalInvestment ? x.value / s.totalInvestment : 0]), ['项目总投资', s.totalInvestment || 0, 1]], [28, 18, 14]);
+  addSheet(wb, '投资构成明细', [
+    ['投资大类', '明细项目', '计算过程/依据', '计算基数', '单位', '单价/费率', '金额（万元）', '占总投比例', '录入方式'],
+    ...(result.investmentDetail || []).map(x => [x.category, x.item, x.formula, x.quantity, x.unit, x.unitRate, x.amount, x.share, x.inputMode === 'amount' ? '按实际投资总额' : '按建筑面积单价']),
+    ['', '项目总投资', '各项投资明细合计', '', '', '', s.totalInvestment || 0, 1, ''],
+  ], [18, 24, 58, 18, 12, 18, 18, 16, 20]);
+  const floorWs = addSheet(wb, '楼层均价', [['楼栋', '楼层', '商户计租口径', '铺位/楼层建筑面积（㎡，不含公区）', '实用面积（㎡）', '商户计租面积（㎡）', '平均月租金（元/㎡/月）', '物业费单价（元/㎡/月）', '商管费单价（元/㎡/月）', '空调费单价（元/㎡/月）', '满租月租金（万元）', '满租月物业费（元）', '满租月商管费（元）', '满租月空调费（元）', '满租月三项费用合计（元）', '满租年三项费用（万元）', '租金收入占比'], ...(result.floors || []).map(x => { const monthlyWan = Number(x.monthlyRevenue || x.monthlyRent || 0) / 10000; const monthlyProperty = Number(x.monthlyPropertyFee || 0); const monthlyCommercial = Number(x.monthlyCommercialManagementFee || 0); const monthlyCentral = Number(x.monthlyCentralAcFee || 0); return [x.building || '1号楼', x.name, x.rentAreaBasis === 'building' ? '建筑面积' : x.rentAreaBasis === 'leasable' ? '实用面积' : '混合口径', roundArea(x.buildingArea), roundArea(x.leasableArea), roundArea(x.rentArea), x.weightedRent || x.avgRent, Number(x.propertyFee || 0), Number(x.commercialManagementFee || 0), Number(x.centralAcFee || 0), monthlyWan, monthlyProperty, monthlyCommercial, monthlyCentral, monthlyProperty + monthlyCommercial + monthlyCentral, (monthlyProperty + monthlyCommercial + monthlyCentral) * 12 / 10000, s.totalMonthlyRent ? (Number(x.monthlyRevenue || x.monthlyRent || 0) / s.totalMonthlyRent) : 0]; })], [12, 10, 14, 18, 18, 18, 24, 22, 22, 22, 22, 22, 22, 22, 26, 24, 16]);
+
+  setSheetColumnNumberFormat(floorWs, [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15], '0.00');
+  const exportShopWs = addSheet(wb, '商铺明细', [['楼栋', '铺位号', '楼层', '商户计租口径', '业态', '状态', '建筑面积（㎡）', '实用面积（㎡）', '商户计租面积（㎡）', '租金单价（元/㎡/月）', '物业管理费（元/㎡/月）', '商业管理费（元/㎡/月）', '中央空调费（元/㎡/月）', '满租月物业费（元）', '满租月商管费（元）', '满租月空调费（元）', '满租月三项费用合计（元）', '满租年三项费用（万元）', '商铺计租例外（可选）', '条件', '满租月租金收益（万元）'], ...(result.shops || []).map(x => [x.building || '1号楼', x.id, x.floor, x.rentAreaBasis === 'building' ? '建筑面积' : '实用面积', x.category, x.status || '', roundArea(x.buildingArea), roundArea(x.leasableArea), roundArea(x.rentArea), x.rent, Number(x.propertyFee || 0), Number(x.commercialManagementFee || 0), Number(x.centralAcFee || 0), Number(x.monthlyPropertyFee || 0), Number(x.monthlyCommercialManagementFee || 0), Number(x.monthlyCentralAcFee || 0), Number(x.monthlyServiceFee || 0), Number(x.monthlyServiceFee || 0) * 12 / 10000, x.rentAreaBasisOverride ? (x.rentAreaBasis === 'building' ? '建筑面积' : '实用面积') : '继承上级默认', (x.appliedConditions || []).join('、'), x.monthlyRevenue])], [12, 16, 10, 14, 16, 12, 18, 18, 18, 22, 24, 24, 24, 22, 22, 22, 26, 24, 20, 24, 24]);
+
+  setSheetColumnNumberFormat(exportShopWs, [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], '0.00');
+  const leasingAdjustmentPeriodsExport = Array.isArray(model.operations?.leasingAdjustmentPeriods) ? model.operations.leasingAdjustmentPeriods : [];
+  addSheet(wb, '招商调整阶段', [
+    ['阶段性招商调整规则'],
+    ['阶段名称', '起始运营年', '结束运营年', '租金调整幅度', '目标出租率', '一次性招商成本（万元）', '调整说明'],
+    ...leasingAdjustmentPeriodsExport.map(item => [item.name || '', Number(item.startYear || 0), Number(item.endYear || 0), Number(item.rentAdjustmentRate || 0), Number(item.targetOccupancy || 0), Number(item.oneOffLeasingCost || 0), item.note || '']),
+    [''],
+    ['年度阶段核算结果'],
+    ['运营年', '阶段名称', '阶段租金调整因子', '基础租金递增因子', '最终租金递增因子', '有效出租率', '阶段招商成本（万元）', '租金收入（万元）', 'NOI（万元）'],
+    ...(result.annual || []).filter(x => Number(x.opYear) > 0 && x.leasingStageName).map(x => [x.opYear, x.leasingStageName || '', Number(x.leasingStageRentFactor || 1), Number(x.baseRentGrowthFactor || 1), Number(x.rentGrowthFactor || 1), Number(x.occupancy || 0), Number(x.leasingStageCost || 0), Number(x.rentRevenue || 0), Number(x.noi || 0)]),
+    [''],
+    ['计算口径', '阶段租金因子 = 基础年度递增因子 ×（1 + 阶段租金调整幅度）；目标出租率填0时沿用原出租率；一次性招商成本只计入阶段起始年。'],
+  ], [24, 16, 16, 20, 18, 26, 56]);
+  const leasingStageWs = wb.Sheets['招商调整阶段'];
+  leasingAdjustmentPeriodsExport.forEach((_, index) => {
+    const row = 3 + index;
+    for (const column of ['B', 'C', 'F']) if (leasingStageWs[`${column}${row}`]) leasingStageWs[`${column}${row}`].z = '0.00';
+    for (const column of ['D', 'E']) if (leasingStageWs[`${column}${row}`]) leasingStageWs[`${column}${row}`].z = '0.00%';
+  });
+  addSheet(wb, '租赁联营规则', [
+    ['业态', '结算方式', '当前保底租金（元/㎡/月）', '保底租金常规区间', '当前销售基数（元/㎡/月）', '销售基数常规区间（元/㎡/月）', '当前扣点率', '扣点率常规区间', '扣点收益（元/㎡/月）', '业态系数', '行业基准方案', '基准版本', '销售修正系数', '数据来源'],
+    ...(model.categories || []).map(item => {
+      const salesMin = item.benchmarkSalesMin == null ? '' : Number(item.benchmarkSalesMin);
+      const salesMax = item.benchmarkSalesMax == null ? '' : Number(item.benchmarkSalesMax);
+      const rateMin = item.benchmarkConcessionMin == null ? '' : Number(item.benchmarkConcessionMin);
+      const rateMax = item.benchmarkConcessionMax == null ? '' : Number(item.benchmarkConcessionMax);
+      const rentMin = item.benchmarkRentMin == null ? '' : Number(item.benchmarkRentMin);
+      const rentMax = item.benchmarkRentMax == null ? '' : Number(item.benchmarkRentMax);
+      return [item.name, item.revenueMode || 'inherit', Number(item.rent || 0), rentMin === '' ? '' : `${rentMin}–${rentMax}`, Number(item.salesPerSqmMonth || 0), salesMin === '' ? '' : `${salesMin}–${salesMax}`, Number(item.concessionRate || 0), rateMin === '' ? '' : `${rateMin}–${rateMax}`, Number(item.salesPerSqmMonth || 0) * Number(item.concessionRate || 0), Number(item.factor || 1), settlementPresetLabels[item.benchmarkPreset] || '', item.benchmarkVersion || '', item.benchmarkSalesFactor == null ? '' : Number(item.benchmarkSalesFactor), item.benchmarkSource || ''];
+    }),
+    [''],
+    ['数据口径', model.settlementBenchmark?.source || '行业常规基准；正式招商前应以本地竞品、品牌流水、合同扣点和实地访谈校准。'],
+    ['重要边界', '行业基准和地区/商业侦测修正不等同于当地实测销售大数据；未接入授权租户流水数据库。'],
+  ], [18, 18, 26, 22, 28, 30, 16, 20, 24, 14, 28, 14, 16, 72]);
+  const settlementRuleWs = wb.Sheets['租赁联营规则'];
+  setSheetColumnNumberFormat(settlementRuleWs, [2, 4, 6, 8, 9, 12], '0.00');
+  setSheetColumnNumberFormat(settlementRuleWs, [7], '0.00%');
+  addSheet(wb, '周边市场分析', [['指标', '结果'], ['项目租金单价（元/㎡/月）', result.marketSummary.projectAverageRent], ['市场租金参考均价（元/㎡/月）', result.marketSummary.weightedAverageRent], ['市场中位数（元/㎡/月）', result.marketSummary.medianRent], ['市场25分位（元/㎡/月）', result.marketSummary.p25Rent], ['市场75分位（元/㎡/月）', result.marketSummary.p75Rent], ['项目定价位置', result.marketSummary.position], ...(result.marketSummary.conclusions || []).map((x, i) => [`结论${i + 1}`, x])], [30, 80]);
+  const detection = model.market?.lastAnalysis || {};
+  addSheet(wb, '3-5公里商业侦测', [
+    ['指标','结果','说明'],
+    ['侦测评分', detection.detectionScore, '综合商业、锚点、交通、居住、配套和业态多样性'],
+    ['商圈等级', detection.marketGrade, 'A级/成熟、B级/成长、C级/培育、D级/远端或潜力'],
+    ['商业类POI', detection.commercialCount, '购物、餐饮、娱乐、服务、酒店、金融和商务等'],
+    ['直接竞品', detection.competitorCount, '购物中心、百货、超市和传统市场'],
+    ['商业锚点', detection.anchorCount, '购物中心、百货、影院、酒店等'],
+    ['交通配套', detection.transportCount, '公共交通、轨道站点和停车设施'],
+    ['居住社区', detection.residentialCount, '住宅社区和居住片区'],
+    ['竞争判断', detection.competitionLevel, '基于商业密度和竞品数量'],
+    [''], ['分圈层统计'], ['圈层','商业POI','直接竞品','交通配套','居住片区','业态数量'],
+    ...(detection.ringStats || []).map(x => [x.label, x.commercialCount, x.competitorCount, x.transportCount, x.residentialCount, x.categoryCount]),
+    [''], ['周边业态结构'], ['业态','POI数量'],
+    ...(detection.categories || []).map(x => [x.name, x.count]),
+    [''], ['主要竞品'], ['名称','业态','距离（km）'],
+    ...(detection.competitors || []).map(x => [x.name, x.category, x.distanceKm]),
+    [''], ['侦测结论'], ['结论'],
+    ...(detection.conclusions || []).map(x => [x]),
+    [''], ['商业机会'], ['机会'],
+    ...(detection.opportunities || []).map(x => [x]),
+    [''], ['数据边界', detection.coverageNote || '公开地图数据不含人口、销售额和授权租金；正式决策需结合实地调查。']
+  ], [22, 30, 70]);
+  addSheet(wb, '竞品租金样本', [['样本名称', '地址', '楼层', '业态', '可租赁面积（㎡）', '月租金（元/㎡/月）', '数据日期', '距项目（km）', '备注'], ...(model.market?.comparables || []).map(x => [x.name, x.address, x.floor, x.category, x.leasableArea, x.rent, x.date, x.distanceKm, x.note])], [24, 30, 10, 16, 18, 22, 14, 14, 28]);
+  addSheet(wb, '项目时间轴', [
+    ['开发经营时间轴与关键资金节点'],
+    ['项目立项 / 进场日期', result.timeline?.investmentDate || ''],
+    ['建设开工日期', result.timeline?.constructionStartDate || ''],
+    ['计划竣工日期', result.timeline?.constructionEndDate || ''],
+    ['项目接管 / 进场日期', result.timeline?.handoverDate || ''],
+    ['招商启动日期', result.timeline?.leasingStartDate || ''],
+    ['计划开业日期', result.timeline?.openingDate || ''],
+    ['运营结束日期', result.timeline?.operationEndDate || ''],
+    ['建设期（月）', result.timeline?.constructionMonths || 0],
+    ['筹备招商期（月）', result.timeline?.leasingMonths || 0],
+    ['运营期（月）', result.timeline?.operationMonths || 0],
+    ['业主租金支付时点', result.timeline?.ownerRentPaymentTiming === 'prepay' ? '先付后用' : '先用后付'],
+    ['业主租金支付频率', result.timeline?.ownerRentPaymentFrequency || 'monthly'],
+    ['业主租金起付日期', result.timeline?.ownerRentPaymentStartDate || ''],
+    ['业主租赁保证金（万元）', result.timeline?.ownerDepositAmount || 0],
+    ['业主保证金支付日期', result.timeline?.ownerDepositPaymentDate || ''],
+    ['业主保证金退还日期', result.timeline?.ownerDepositRefundDate || ''],
+    [''],
+    ['关键资金节点'],
+    ['日期', '节点', '类型', '金额（万元）'],
+    ...(result.keyCashEvents || []).map(x => [x.date, x.name, x.category, x.amount]),
+  ], [28, 36, 22, 22]);
+  addSheet(wb, '招商开业里程碑', [
+    ['日期', '目标出租率', '可实现月租金（元）', '年化租金（万元）', '开业前参考', '说明'],
+    ...(result.leasingMilestoneAnalysis || []).map(x => [x.date, x.occupancy, x.monthlyRentPotential, x.annualRentPotential, x.includedInOpeningOccupancy ? '计入开业前参考' : '开业后展示', x.note]),
+  ], [18, 18, 24, 24, 22, 60]);
+  addSheet(wb, '业态收款分析', [
+    ['业态', '满租月租金（万元/月）', '已租月租金（万元/月）', '收款方式', '保证金月数', '预付租金月数', '保证金流入（万元）', '预付租金流入（万元）', '收款节点'],
+    ...(result.categoryPaymentAnalysis || []).map(x => [x.category, Number(x.monthlyRevenue || 0) / 10000, Number(x.occupiedMonthlyRevenue || 0) / 10000, x.paymentModeLabel || '', x.depositMonths || 0, x.prepaidRentMonths || 0, x.depositCashInflow || 0, x.prepaidRentCashInflow || 0, (x.paymentEvents || []).map(event => `${event.date}: 保证金${Number(event.depositCashInflow || 0).toFixed(2)}/预付${Number(event.prepaidRentCashInflow || 0).toFixed(2)}`).join('；') || '按首年最低出租率']),
+  ], [20, 24, 24, 22, 16, 18, 22, 24, 80]);
+  addSheet(wb, '自然年运营报表', naturalYearReportSheetRows(result), [12, 18, 18, 10, 12, 12, 12, 16, 16, 16, 16, 16, 16, 16, 16, 16, 24, 16, 14, 16, 16, 16, 20, 22, 22, 40]);
+  const annualYears = Number(model.project.operationYears || result.annual?.length || 20);
+  const annualExportRows = (result.annual || []).map(x => {
+    const feeServiceCost = Number(x.propertyTeamCost || 0) + Number(x.securityCost || 0) + Number(x.cleaningCost || 0) + Number(x.energyCost || 0);
+    return [x.opYear, x.phase || '运营期', x.calendarYear, x.leasingStageName || '', x.leasingStageRentFactor || 1, x.baseRentGrowthFactor || x.rentGrowthFactor, x.rentGrowthFactor, x.propertyFeeGrowthFactor, x.commercialManagementGrowthFactor, x.centralAcGrowthFactor, x.occupancy, x.rentCollectionRate, x.scheduledRentRevenue, x.uncollectedRentRevenue, x.collectedRentRevenue, x.propertyManagementRevenue, x.commercialManagementRevenue, x.centralAcRevenue, x.propertyRevenue, feeServiceCost, x.propertyRevenue - feeServiceCost, x.revenue, x.outputVat, x.inputVat, x.vatPayable, x.propertyTax, x.landUseTax, x.stampDuty, x.vatSurcharge, x.localFund, x.taxes, x.projectIncomeTax, x.taxCashOutflow, x.equityIncomeTax || x.incomeTax || 0, x.staffCost, x.outsourcedManagementFee || 0, x.officeCost, x.leasingAdjustmentFactor, x.leasingCost, x.leasingStageCost || 0, x.operationsAdjustmentFactor, x.extraOperatingCost, x.marketingCost, x.maintenanceCost, x.ownerLandRent, x.ownerPropertyRent, x.ownerRent, x.operatingCost - x.staffCost - x.officeCost - x.leasingCost - (x.leasingStageCost || 0) - x.marketingCost - x.maintenanceCost - (x.ownerRent || 0) - (x.extraOperatingCost || 0), x.operatingCostExOwnerRent, x.operatingCost, x.noi, x.projectCashFlow, x.cumulativeProjectCashFlow];
+  });
+  addSheet(wb, '经营归集与为0原因', [['归类', '项目', '计算口径与数据出处', '稳定月均（万元）', '稳定年（万元）', '运营期累计（万元）', '为0原因 / 数据状态', '汇总属性'], ...buildOperatingLedgerExportRows(result)], [14, 32, 64, 18, 18, 20, 54, 12]);
+  addSheet(wb, `年度收益${annualYears}年`, [['运营年', '阶段', '日历年', '招商调整阶段', '阶段租金调整因子', '基础租金递增因子', '最终租金递增因子', '物业费递增因子', '商管费递增因子', '空调费递增因子', '出租率', '收租率', '应收租金', '未收租金', '实收租金', '物业管理费收入', '商业管理费收入', '中央空调费收入', '物业+商管+空调收费合计', '对应物业/能耗成本', '收费结余（非净利润）', '营业收入', '销项税', '进项税', '应纳增值税', '房产税', '土地使用税', '印花税', '附加税', '地方基金', '经营税费', '融资前项目所得税', '项目税费现金支出', '融资后股权所得税', '人员及服务成本', '第三方物业服务管理费', '办公行政', '招商费用系数', '招商费用', '阶段招商成本', '运营成本系数', '额外成本', '营销费用', '维保费用', '业主租金—土地', '业主租金—物业', '业主租金合计', '其他运营及税费', '运营成本（不含业主租金）', '运营成本', 'NOI', '项目现金流', '累计项目现金流'], ...annualExportRows], [10,16,10,14,16,16,16,16,20,20,20,12,12,18,18,18,18,16,14,14,22,18,16,14,14,14,14,14,16,16,18,18,22,18,18,22,16,16,16,16,14,16,16,16,16,16,22,18,14,16,18,22]);
+
+  addSheet(wb, '敏感性分析', [['租金变化 ↓ / 投资变化 →', ...(result.sensitivity.capexSteps || []).map(v => (v * 100).toFixed(0) + '%')], ...(result.sensitivity.rentSteps || []).map((rent, i) => [(rent * 100).toFixed(0) + '%', ...(result.sensitivity.npvMatrix[i] || [])])], [24, 14, 14, 14, 14, 14]);
+  addSheet(wb, '分析结论', [['类型', '内容'], ...(result.analysis.bullets || []).map(x => ['分析结论', x]), ...(result.analysis.recommendations || []).map(x => ['建议', x]), ...(result.diagnostics || []).map(x => [x.level, `${x.title}：${x.detail}`])], [18, 100]);
+  formatWorkbook(wb, {
+    profile: 'report',
+    title: '项目投资测算与收益分析',
+    subtitle: `${result.summary.location || '项目所在地'}｜投资、收入、成本、税费、现金流与资本回报`,
+    fileKind: '投资测算报告',
+    projectName: result.summary.projectName || '商业地产项目',
+    note: '本工作簿用于投资初筛与方案比较；正式决策前应结合属地政策、合同、造价、税务和现场调研复核。',
+  });
+  return workbookBlob(wb);
+}
+
+const PPT_FONT = 'Hiragino Sans GB';
+const PPT_THEME = {
+  navy: '103B33',
+  navy2: '174E43',
+  green: '1D6B57',
+  gold: 'D6A84B',
+  goldSoft: 'F7ECD4',
+  greenSoft: 'E5F0EB',
+  cream: 'FBF8F1',
+  paper: 'FFFDF9',
+  white: 'FFFFFF',
+  text: '17211E',
+  muted: '66736F',
+  line: 'DDE5E1',
+  red: 'B94A48',
+};
+
+function pptTable(slide, rows, options = {}) {
+  const fontSize = Number(options.fontSize || 8);
+  const headerFontSize = Number(options.headerFontSize || Math.max(fontSize, 8.5));
+  const cellMargin = Number(options.margin || options.cellMargin || 0.04);
+  const styledRows = rows.map((row, rowIndex) => row.map((cell, colIndex) => {
+    const rawText = cell && typeof cell === 'object' && Object.prototype.hasOwnProperty.call(cell, 'text') ? cell.text : cell;
+    const text = rawText === null || rawText === undefined ? '' : String(rawText);
+    const isHeader = rowIndex === 0;
+    const isTotal = rowIndex > 0 && /^(合计|总计|小计)/.test(String(row[0] || ''));
+    const numeric = rowIndex > 0 && colIndex > 0 && (/^[-−]?[\d,.]+%?$/.test(text) || typeof cell === 'number');
+    return {
+      text,
+      options: {
+        fontFace: PPT_FONT,
+        fontSize: isHeader ? headerFontSize : fontSize,
+        bold: isHeader || isTotal,
+        color: isHeader ? PPT_THEME.white : (isTotal ? PPT_THEME.navy : PPT_THEME.text),
+        fill: { color: isHeader ? PPT_THEME.navy : (isTotal ? 'EAF4EF' : (rowIndex % 2 === 0 ? 'FCFAF5' : PPT_THEME.white)) },
+        align: isHeader ? 'center' : (numeric ? 'right' : 'left'),
+        valign: 'mid',
+        margin: cellMargin,
+      },
+    };
+  }));
+  const tableOptions = { ...options };
+  for (const key of ['fill', 'color', 'fontFace', 'fontSize', 'headerFontSize', 'margin', 'cellMargin']) delete tableOptions[key];
+  tableOptions.border = options.border || { color: PPT_THEME.line, width: 0.55 };
+  return slide.addTable(styledRows, tableOptions);
+}
+
+function addSlideTitle(slide, title, subtitle = '', options = {}) {
+  slide.background = { color: PPT_THEME.paper };
+  slide.addShape('rect', { x: 0, y: 0, w: 13.333, h: 0.12, fill: { color: PPT_THEME.navy }, line: { color: PPT_THEME.navy } });
+  slide.addText(title, { x: 0.58, y: 0.34, w: 11.9, h: 0.44, fontFace: PPT_FONT, fontSize: 21, bold: true, color: PPT_THEME.navy, margin: 0, breakLine: false });
+  if (subtitle) slide.addText(subtitle, { x: 0.6, y: 0.82, w: 11.9, h: 0.28, fontFace: PPT_FONT, fontSize: 8.8, color: PPT_THEME.muted, margin: 0, breakLine: false });
+  slide.addShape('rect', { x: 0.6, y: 1.14, w: 0.52, h: 0.035, fill: { color: PPT_THEME.gold }, line: { color: PPT_THEME.gold } });
+  slide.addShape('rect', { x: 0.6, y: 7.07, w: 12.05, h: 0.01, fill: { color: PPT_THEME.line }, line: { color: PPT_THEME.line } });
+  slide.addText(options.projectName || '多多 · 商业地产', { x: 0.6, y: 7.12, w: 7.2, h: 0.18, fontFace: PPT_FONT, fontSize: 7.5, color: PPT_THEME.muted, margin: 0, breakLine: false });
+  if (options.pageNumber) slide.addText(String(options.pageNumber).padStart(2, '0'), { x: 12.1, y: 7.1, w: 0.55, h: 0.2, fontFace: PPT_FONT, fontSize: 8, bold: true, color: PPT_THEME.green, align: 'right', margin: 0, breakLine: false });
+}
+
+function pptNumber(value, digits = 2) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits }) : '—';
+}
+
+function pptPercent(value, digits = 2) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : '—';
+}
+
+function pptNormalizeNumberText(value) {
+  return String(value ?? '')
+    .replace(/([-−]?\d[\d,]*(?:\.\d+)?)\s*万元/g, (_, n) => `${pptNumber(String(n).replace('−', '-').replace(/,/g, ''))} 万元`)
+    .replace(/([-−]?\d[\d,]*(?:\.\d+)?)\s*万元\/年/g, (_, n) => `${pptNumber(String(n).replace('−', '-').replace(/,/g, ''))} 万元/年`)
+    .replace(/([-−]?\d+(?:\.\d+)?)\s*%/g, (_, n) => `${(Number(String(n).replace('−', '-'))).toFixed(2)}%`);
+}
+
+function pptMetricCard(slide, { x, y, w, h, label, value, note = '', fill = PPT_THEME.greenSoft, valueColor = PPT_THEME.navy, line = 'C9DDD4', valueFontSize = 16 }) {
+  slide.addShape('roundRect', { x, y, w, h, radius: 0.08, fill: { color: fill }, line: { color: line, width: 0.6 } });
+  slide.addText(label, { x: x + 0.18, y: y + 0.12, w: w - 0.36, h: 0.2, fontFace: PPT_FONT, fontSize: 7.6, color: PPT_THEME.muted, margin: 0, breakLine: false });
+  slide.addText(value, { x: x + 0.18, y: y + 0.4, w: w - 0.36, h: 0.32, fontFace: PPT_FONT, fontSize: valueFontSize, bold: true, color: valueColor, margin: 0, breakLine: false });
+  if (note) slide.addText(note, { x: x + 0.18, y: y + h - 0.25, w: w - 0.36, h: 0.16, fontFace: PPT_FONT, fontSize: 6.8, color: PPT_THEME.muted, margin: 0, breakLine: false });
+}
+
+function pptSectionLabel(slide, text, x, y, w, color = PPT_THEME.green) {
+  slide.addText(text, { x, y, w, h: 0.22, fontFace: PPT_FONT, fontSize: 8.5, bold: true, color, margin: 0, breakLine: false });
+}
+
+function pptInsightBar(slide, { x, y, w, h, title, body, fill = PPT_THEME.cream, accent = PPT_THEME.gold }) {
+  slide.addShape('rect', { x, y, w, h, fill: { color: fill }, line: { color: PPT_THEME.line, width: 0.4 } });
+  slide.addShape('rect', { x, y, w: 0.06, h, fill: { color: accent }, line: { color: accent } });
+  slide.addText(title, { x: x + 0.2, y: y + 0.13, w: 1.2, h: 0.22, fontFace: PPT_FONT, fontSize: 8.5, bold: true, color: accent, margin: 0, breakLine: false });
+  slide.addText(body, { x: x + 1.25, y: y + 0.1, w: w - 1.45, h: h - 0.18, fontFace: PPT_FONT, fontSize: 9.2, color: PPT_THEME.text, margin: 0, valign: 'mid', breakLine: false });
+}
+
+async function exportPPT(result) {
+  const pptx = new PptxGenJS();
+  const s = result.summary;
+  const settlementPresetLabels = { shopping: '购物中心行业常规', department: '百货商场行业常规', outlet: '奥特莱斯行业常规', street: '街区商业行业常规', community: '社区商业行业常规', community_base: '社区底商行业常规' };
+  pptx.layout = 'LAYOUT_WIDE';
+  pptx.author = '多多 · 商业地产';
+  pptx.subject = '商业地产投资测算汇报';
+  pptx.title = `${s.projectName || '商业项目'}投资测算`;
+  pptx.company = '多多 · 商业地产';
+  pptx.lang = 'zh-CN';
+  pptx.theme = { headFontFace: PPT_FONT, bodyFontFace: PPT_FONT, lang: 'zh-CN' };
+  let pptPageNumber = 1;
+  const addContentSlide = (title, subtitle = '') => {
+    const nextSlide = pptx.addSlide();
+    addSlideTitle(nextSlide, title, subtitle, { pageNumber: ++pptPageNumber, projectName: s.projectName || '多多 · 商业地产' });
+    return nextSlide;
+  };
+
+  let slide = pptx.addSlide();
+  slide.background = { color: PPT_THEME.navy };
+  slide.addShape(pptx.ShapeType.rect, { x: 0.7, y: 0.62, w: 0.08, h: 6.08, fill: { color: PPT_THEME.gold }, line: { color: PPT_THEME.gold } });
+  slide.addText('多多 · 商业地产', { x: 1.05, y: 0.62, w: 5, h: 0.35, fontFace: PPT_FONT, fontSize: 10, color: PPT_THEME.gold, charSpacing: 2, margin: 0 });
+  slide.addText(s.projectName || '商业项目', { x: 1.05, y: 1.55, w: 11.1, h: 1.0, fontFace: PPT_FONT, fontSize: 33, bold: true, color: PPT_THEME.white, margin: 0 });
+  slide.addText('投资测算与收益分析汇报', { x: 1.05, y: 2.62, w: 8.0, h: 0.55, fontFace: PPT_FONT, fontSize: 20, color: 'C8D8D3', margin: 0 });
+  slide.addText(s.location || '', { x: 1.05, y: 3.25, w: 10.5, h: 0.4, fontFace: PPT_FONT, fontSize: 11.5, color: 'A9C0BA', margin: 0 });
+  const coverMetrics = [
+    ['项目总投资', `${Number(s.totalInvestment || 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 万元`],
+    ['项目IRR', s.projectIrr == null ? '不适用' : `${(Number(s.projectIrr) * 100).toFixed(2)}%`],
+    ['测算状态', s.status || '待完善'],
+  ];
+  coverMetrics.forEach((item, index) => {
+    const x = 1.05 + index * 3.75;
+    slide.addShape(pptx.ShapeType.roundRect, { x, y: 4.2, w: 3.35, h: 1.05, fill: { color: index === 1 ? '174E43' : '12453B' }, line: { color: '527C70', width: 0.6 }, radius: 0.06 });
+    slide.addText(item[0], { x: x + 0.2, y: 4.36, w: 2.95, h: 0.22, fontFace: PPT_FONT, fontSize: 8.5, color: 'A9C0BA', margin: 0 });
+    slide.addText(item[1], { x: x + 0.2, y: 4.68, w: 2.95, h: 0.36, fontFace: PPT_FONT, fontSize: 16, bold: true, color: PPT_THEME.white, margin: 0 });
+  });
+  slide.addText(`${new Date().toLocaleDateString('zh-CN')}｜人民币｜金额单位：万元`, { x: 1.05, y: 6.55, w: 8, h: 0.28, fontFace: PPT_FONT, fontSize: 9, color: '88A7A0', margin: 0 });
+
+  slide = addContentSlide('核心结论', '基于当前输入假设自动生成');
+  const kpis = [
+    ['项目总投资', `${pptNumber(s.totalInvestment)} 万元`, '资本化投入口径'],
+    ['项目IRR', s.projectIrr == null ? '不适用' : pptPercent(s.projectIrr), '项目现金流内部收益率'],
+    ['项目NPV', `${pptNumber(s.projectNpv)} 万元`, '按设定折现率测算'],
+    ['稳定期NOI', `${pptNumber(s.stableNoi)} 万元/年`, '稳定运营年经营净现金流'],
+    ['NOI回报率', pptPercent(s.noiYield), '稳定期NOI ÷ 项目总投资'],
+    ['静态回收期', s.staticPayback == null ? '未回收' : `${pptNumber(s.staticPayback)} 年`, '按累计项目现金流判断'],
+  ];
+  kpis.forEach((item, i) => {
+    const x = 0.75 + (i % 3) * 4.1;
+    const y = 1.52 + Math.floor(i / 3) * 1.62;
+    pptMetricCard(slide, {
+      x, y, w: 3.65, h: 1.22, label: item[0], value: item[1], note: item[2],
+      fill: i < 3 ? PPT_THEME.goldSoft : PPT_THEME.greenSoft,
+      line: i < 3 ? 'E9D6AC' : 'C9DDD4',
+    });
+  });
+  pptInsightBar(slide, {
+    x: 0.75, y: 5.0, w: 11.85, h: 0.92,
+    title: `初筛状态 ${s.status || '待完善'}`,
+    body: `当前模型结论为“${s.status || '待完善'}”。优先复核租金实现、工程投资、开业去化节奏和运营成本假设；金额单位：万元，比例保留两位小数。`,
+    accent: s.status === '通过初筛' ? PPT_THEME.green : PPT_THEME.red,
+    fill: s.status === '通过初筛' ? PPT_THEME.greenSoft : 'FBEFED',
+  });
+
+  slide = addContentSlide('投资构成', '土地、工程、装修、预备费与开办资金');
+  slide.addChart(pptx.ChartType.doughnut, [{ name: '投资构成', labels: result.investmentBreakdown.map(x => x.name), values: result.investmentBreakdown.map(x => x.value) }], {
+    x: 0.75, y: 1.5, w: 6.1, h: 4.9, holeSize: 58, showLegend: false, showPercent: true, showValue: false, dataLabelFontFace: PPT_FONT, dataLabelFontSize: 8, dataLabelColor: PPT_THEME.white,
+    chartColors: ['103B33', '1D6B57', 'D6A84B', '8EA9A1', 'B7A888', '527C70', 'E4CF9F'],
+    showTitle: false,
+  });
+  let py = 1.68;
+  for (const item of result.investmentBreakdown) {
+    slide.addText(item.name, { x: 7.0, y: py, w: 2.6, h: 0.25, fontFace: PPT_FONT, fontSize: 10, color: '17211E' });
+    slide.addText(`${pptNumber(item.value)} 万元`, { x: 9.5, y: py, w: 2.6, h: 0.25, fontFace: PPT_FONT, fontSize: 10, bold: true, color: '103B33', align: 'right', breakLine: false });
+    py += 0.52;
+  }
+
+  slide = addContentSlide(`${Number(result.model.project.operationYears || result.annual?.length || 20)}年营业收入与NOI`, '金额单位：万元');
+  slide.addChart(pptx.ChartType.line, [
+    { name: '营业收入', labels: result.annual.map(x => `Y${x.opYear}`), values: result.annual.map(x => x.revenue) },
+    { name: 'NOI', labels: result.annual.map(x => `Y${x.opYear}`), values: result.annual.map(x => x.noi) },
+    { name: '税费', labels: result.annual.map(x => `Y${x.opYear}`), values: result.annual.map(x => x.taxes) },
+  ], { x: 0.7, y: 1.45, w: 12.0, h: 4.75, showLegend: true, legendPos: 't', showTitle: false, lineDataSymbol: 'none', chartColors: ['1D6B57', 'D6A84B', 'B94A48'], catAxisLabelFontSize: 8, valAxisLabelFontSize: 9, catAxisLabelFontFace: PPT_FONT, valAxisLabelFontFace: PPT_FONT, dataLabelFontFace: PPT_FONT, dataLabelFontSize: 9, valGridLine: { color: 'E8EEEA', style: 'solid', size: 0.5 }, legendFontFace: PPT_FONT, legendFontSize: 8 });
+  slide.addText(`稳定期费用性收入：物业管理费 ${Number(s.stablePropertyManagementIncome || 0).toFixed(2)} 万元/年｜商业管理费 ${Number(s.stableCommercialManagementIncome || 0).toFixed(2)} 万元/年｜中央空调费 ${Number(s.stableCentralAcIncome || 0).toFixed(2)} 万元/年｜三项合计 ${Number(s.stablePropertyFeeIncome || 0).toFixed(2)} 万元/年`, { x: 0.72, y: 6.35, w: 11.95, h: 0.5, fontFace: PPT_FONT, fontSize: 8, color: '17211E', fill: { color: 'E5F0EB' }, margin: 0.08, valign: 'mid' });
+
+  slide = addContentSlide('楼栋与楼层面积及租金汇总', `商户计租口径：${result.model.project.rentAreaBasis === 'building' ? '建筑面积' : '实用面积（套内/租赁面积）'}｜业主支付口径：${result.model.project.ownerRentAreaBasis === 'leasable' ? '实用/可租赁面积' : '建筑面积'}｜表内面积为铺位/楼层明细面积，不含公区｜项目总建筑面积 ${Number(s.grossFloorArea || 0).toFixed(2)}㎡`);
+  const floorData = result.floors || [];
+  const floorSummaryRows = [['楼栋','楼层','建筑㎡','实用㎡','计租㎡','租金单价','年租金（万元）','占比'], ...floorData.slice(0, 12).map(x => [x.building || '1号楼', x.name, pptNumber(x.buildingArea), pptNumber(x.leasableArea), pptNumber(x.rentArea), pptNumber(x.weightedRent || x.avgRent || 0), pptNumber(Number(x.monthlyRevenue || x.monthlyRent || 0) * 12 / 10000), pptPercent(Number(x.monthlyRevenue || x.monthlyRent || 0) / Math.max(Number(s.totalMonthlyRent || 0), 1))])];
+  pptTable(slide, floorSummaryRows, { x: 0.55, y: 1.38, w: 12.3, colW: [1.25, 0.9, 1.35, 1.35, 1.35, 1.55, 1.9, 1.2], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 8.5, margin: 0.04, rowH: 0.4, autoFit: false });
+  const summaryRentArea = floorData.reduce((sum, x) => sum + Number(x.rentArea || 0), 0);
+  const summaryMonthlyRent = floorData.reduce((sum, x) => sum + Number(x.monthlyRevenue || x.monthlyRent || 0), 0) || Number(s.totalMonthlyRent || 0);
+  pptMetricCard(slide, { x: 0.7, y: 4.25, w: 3.7, h: 1.12, label: '项目计租面积', value: `${pptNumber(summaryRentArea)} ㎡`, note: '楼层/铺位明细合计，不含公区', fill: PPT_THEME.greenSoft, line: 'C9DDD4' });
+  pptMetricCard(slide, { x: 4.65, y: 4.25, w: 3.7, h: 1.12, label: '项目租金单价', value: `${pptNumber(summaryRentArea ? summaryMonthlyRent / summaryRentArea : 0)} 元/㎡/月`, note: '满租月租金 ÷ 项目计租面积', fill: PPT_THEME.goldSoft, line: 'E9D6AC' });
+  pptMetricCard(slide, { x: 8.6, y: 4.25, w: 3.7, h: 1.12, label: '满租月租金', value: `${pptNumber(summaryMonthlyRent / 10000)} 万元/月`, note: 'Σ各楼层月租金，不含出租率与免租期', fill: PPT_THEME.cream, line: PPT_THEME.line });
+  pptInsightBar(slide, { x: 0.7, y: 5.65, w: 11.6, h: 0.78, title: '统一口径', body: '楼层租金单价 = 该层年租金 ÷ 该层计租面积 ÷ 12；项目租金单价 = 项目年租金 ÷ 项目计租面积 ÷ 12。面积、单价、金额均保留两位小数。', accent: PPT_THEME.green, fill: PPT_THEME.greenSoft });
+  if (floorData.length > 12) slide.addText('仅展示前12个楼层，完整明细见Excel。', { x: 0.72, y: 6.55, w: 5, h: 0.22, fontFace: PPT_FONT, fontSize: 7.5, color: PPT_THEME.muted, breakLine: false });
+
+  slide = addContentSlide('租赁与联营规则', `行业基准：${settlementPresetLabels[result.model.settlementBenchmark?.preset] || '购物中心行业常规'}｜销售修正 ×${Number(result.model.settlementBenchmark?.salesFactor || 1).toFixed(2)}`);
+  const revenueModeLabels = { rent: '纯租金', concession: '纯联营扣点', guarantee_or_concession: '保底与扣点取高' };
+  const paymentModeLabels = { deposit_and_prepaid: '押金＋预付租金', deposit_only: '仅收押金', prepaid_only: '仅收预付租金' };
+  const projectRevenueMode = result.model.project?.revenueModel || 'rent';
+  const projectPaymentMode = result.model.operations?.rentCollectionMode || 'deposit_and_prepaid';
+  const projectDepositMonths = Number(result.model.operations?.depositMonths || 0);
+  const projectPrepaidMonths = Number(result.model.operations?.prepaidRentMonths || 0);
+  const catRows = [['业态', '保底租金', '销售基数 / 常规区间', '扣点率 / 常规区间', '扣点收益/㎡', '结算方式', '支付方式', '保证金月数', '预付租金月数'], ...(result.model.categories || []).map(x => {
+    const salesRange = x.benchmarkSalesMin == null ? '' : `${pptNumber(x.benchmarkSalesMin)}–${pptNumber(x.benchmarkSalesMax)}`;
+    const rateRange = x.benchmarkConcessionMin == null ? '' : `${pptPercent(x.benchmarkConcessionMin)}–${pptPercent(x.benchmarkConcessionMax)}`;
+    const effectiveRevenueMode = x.revenueMode && x.revenueMode !== 'inherit' ? x.revenueMode : projectRevenueMode;
+    const effectivePaymentMode = x.paymentMode && x.paymentMode !== 'inherit' ? x.paymentMode : projectPaymentMode;
+    const depositMonths = x.depositMonths ?? (['deposit_and_prepaid', 'deposit_only'].includes(effectivePaymentMode) ? projectDepositMonths : 0);
+    const prepaidMonths = x.prepaidRentMonths ?? (['deposit_and_prepaid', 'prepaid_only'].includes(effectivePaymentMode) ? projectPrepaidMonths : 0);
+    return [x.name, pptNumber(x.rent), salesRange ? `${pptNumber(x.salesPerSqmMonth)}\n常规 ${salesRange}` : pptNumber(x.salesPerSqmMonth), rateRange ? `${pptPercent(x.concessionRate)}\n常规 ${rateRange}` : pptPercent(x.concessionRate), pptNumber(Number(x.salesPerSqmMonth || 0) * Number(x.concessionRate || 0)), revenueModeLabels[effectiveRevenueMode] || effectiveRevenueMode, paymentModeLabels[effectivePaymentMode] || effectivePaymentMode, `${pptNumber(depositMonths)} 个月`, `${pptNumber(prepaidMonths)} 个月`];
+  })];
+  pptTable(slide, catRows, { x: 0.55, y: 1.36, w: 12.2, colW: [1.05, 1.1, 1.75, 1.75, 1.1, 1.3, 1.3, 1.05, 1.05], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 7.6, headerFontSize: 7.9, margin: 0.035, rowH: 0.5, autoFit: false });
+  pptInsightBar(slide, { x: 0.55, y: 5.25, w: 12.2, h: 0.78, title: '核算口径', body: `当前项目按“${revenueModeLabels[projectRevenueMode] || projectRevenueMode}”核算；保证金与预付租金只影响现金流入时点，不在后续月份重复确认租金收入。`, accent: PPT_THEME.green, fill: PPT_THEME.greenSoft });
+  slide.addText(`数据来源：${result.model.settlementBenchmark?.source || '公开行业常规区间与项目测算经验'}。行业区间仅用于校准，正式招商前应以竞品流水、品牌报价和合同扣点为准。`, { x: 0.55, y: 6.35, w: 12.2, h: 0.4, fontFace: PPT_FONT, fontSize: 7.2, color: PPT_THEME.muted, fill: { color: PPT_THEME.cream }, margin: 0.08, breakLine: false });
+
+  const serviceModeShort = { self: '自营', resident_outsourced: '第三方常驻', non_resident: '第三方非常驻' };
+  const serviceModeText = (result.propertyServiceBreakdown || []).map(item => `${item.name.replace('服务', '')}${serviceModeShort[item.mode] || item.mode}`).join('｜');
+  slide = addContentSlide('组织架构与人员成本', result.model.operations?.staffCostMode === 'area'
+    ? `当前按面积估算企业人员成本 ${(result.summary.stableStaffCost || 0).toFixed(2)} 万元/年｜组织架构为测算参考`
+    : `合计编制 ${result.summary.stableHeadcount || 0} 人｜税前工资 ${(result.summary.annualGrossPayroll || 0).toFixed(2)}｜员工实发 ${(result.summary.annualNetPayroll || 0).toFixed(2)}｜实际人员服务成本 ${(result.summary.stableStaffCost || 0).toFixed(2)} 万元/年｜${serviceModeText}`);
+  const orgRows = [
+    ['部门','岗位构成','编制','税前工资','个人社保','个税','实发工资','单位社保','企业成本'],
+    ...(result.organizationBreakdown || []).map(x => [x.name, (x.positions || []).map(p => `${p.name}${Number(p.headcount) > 1 ? `×${p.headcount}` : ''}`).join('、'), `${x.headcount}人`, (x.grossPayroll || 0).toFixed(2), (x.employeeSocialInsurance || 0).toFixed(2), (x.individualIncomeTax || 0).toFixed(2), (x.netSalary || 0).toFixed(2), (x.employerSocialInsurance || 0).toFixed(2), (x.annualCost || 0).toFixed(2)]),
+  ];
+  pptTable(slide, orgRows, { x: 0.55, y: 1.4, w: 12.2, colW: [1.35, 2.75, 0.65, 1.05, 1.05, 0.85, 1.05, 1.05, 1.2], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 8, margin: 0.035, rowH: 0.46, autoFit: false });
+  const orgHeadcount = Number(result.summary.stableHeadcount || (result.organizationBreakdown || []).reduce((sum, x) => sum + Number(x.headcount || 0), 0));
+  pptMetricCard(slide, { x: 0.7, y: 4.45, w: 2.8, h: 1.1, label: '稳定期编制', value: `${pptNumber(orgHeadcount, 0)} 人`, note: '按当前组织架构汇总', fill: PPT_THEME.greenSoft, line: 'C9DDD4' });
+  pptMetricCard(slide, { x: 3.7, y: 4.45, w: 2.8, h: 1.1, label: '税前工资', value: `${pptNumber(result.summary.annualGrossPayroll)} 万元/年`, note: '员工税前应发', fill: PPT_THEME.goldSoft, line: 'E9D6AC' });
+  pptMetricCard(slide, { x: 6.7, y: 4.45, w: 2.8, h: 1.1, label: '企业人员成本', value: `${pptNumber(result.summary.stableStaffCost)} 万元/年`, note: '含单位社保及服务成本', fill: PPT_THEME.cream, line: PPT_THEME.line });
+  pptMetricCard(slide, { x: 9.7, y: 4.45, w: 2.8, h: 1.1, label: '人均企业成本', value: `${pptNumber(orgHeadcount ? Number(result.summary.stableStaffCost || 0) / orgHeadcount : 0)} 万元/人/年`, note: '企业人员成本 ÷ 编制人数', fill: PPT_THEME.greenSoft, line: 'C9DDD4' });
+  slide.addText(`金额单位：万元/年。月薪按税前应发口径；社保公积金按税前月薪×12个月×配置比例估算。第三方综合管理费合计 ${pptNumber(result.summary.annualOutsourcedManagementFee)} 万元；比例、基数及物业服务合同须按属地政策和实际条款复核。`, { x: 0.7, y: 5.85, w: 11.8, h: 0.55, fontFace: PPT_FONT, fontSize: 7.5, color: PPT_THEME.muted, fill: { color: PPT_THEME.cream }, margin: 0.1, breakLine: false });
+
+  slide = addContentSlide('项目启动资金与资本金杠杆', `建议启动资金 ${(result.summary.recommendedStartupCapital || 0).toFixed(2)} 万元｜周期净利润 ${(result.summary.periodNetProfit || 0).toFixed(2)} 万元｜资本金 ${(result.summary.equityCapital || 0).toFixed(2)} 万元×${(result.summary.leverageMultiple || 0).toFixed(2)}倍｜资本金净收益 ${(result.summary.equityNetCashProfit || 0).toFixed(2)} 万元`);
+  const fundingCards = [
+    ['建议启动资金', result.summary.recommendedStartupCapital || 0, '含资金缺口峰值及安全垫'],
+    ['项目资金缺口峰值', result.summary.peakProjectFundingRequirement || 0, '项目口径'],
+    ['资本金缺口峰值', result.summary.peakEquityFundingRequirement || 0, '资本金口径'],
+    ['累计现金流转正', result.summary.cashFlowBreakEvenYear || '测算期内未转正', result.summary.cashFlowBreakEvenMonth ? `月度计划第${result.summary.cashFlowBreakEvenMonth}个月` : '按年现金流'],
+  ];
+  fundingCards.forEach((card, index) => {
+    const value = typeof card[1] === 'number' ? `${pptNumber(card[1])} 万元` : String(card[1]);
+    pptMetricCard(slide, {
+      x: 0.65 + index * 3.12, y: 1.35, w: 2.9, h: 1.12,
+      label: card[0], value, note: card[2],
+      fill: index === 0 ? PPT_THEME.goldSoft : (index === 3 ? PPT_THEME.cream : PPT_THEME.greenSoft),
+      line: index === 0 ? 'E9D6AC' : PPT_THEME.line,
+      valueColor: index === 0 ? '76591C' : PPT_THEME.navy,
+    });
+  });
+  const phaseCashRows = [['阶段', '项目口径需准备（万元）', '资本金口径需准备（万元）', '阶段项目净现金流（万元）'], ...(result.phaseFundingRequirements || []).filter(x => ['建设期', '筹备招商期', '开业首年'].includes(x.phase)).map(x => [x.phase, pptNumber(x.projectFundingNeed), pptNumber(x.equityFundingNeed), pptNumber(x.projectCashFlow)])];
+  pptTable(slide, phaseCashRows, { x: 0.65, y: 2.78, w: 11.9, colW: [2.3, 3.3, 3.3, 3.0], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 9, margin: 0.05, rowH: 0.55, autoFit: false });
+  pptInsightBar(slide, {
+    x: 0.65, y: 5.68, w: 11.9, h: 0.86,
+    title: '资金安排',
+    body: `关键日期：开工 ${result.timeline?.constructionStartDate || '待定'}｜开业 ${result.timeline?.openingDate || '待定'}｜运营结束 ${result.timeline?.operationEndDate || '待定'}。资金计划按实际日期逐月滚动，已纳入出租率、免租期、起收日期、业主租金付款、保证金及还本付息。`,
+    accent: PPT_THEME.gold, fill: PPT_THEME.cream,
+  });
+
+  slide = addContentSlide('年度运营成本与营销预算', '稳定运营年｜金额单位：万元/年');
+  pptSectionLabel(slide, '稳定年运营成本明细', 0.65, 1.28, 4.5, PPT_THEME.navy);
+  pptSectionLabel(slide, '营销预算配置', 6.8, 1.28, 3.2, PPT_THEME.navy);
+  const costRows = [['成本项目','金额'], ...(result.operatingCostBreakdown || []).map(x => [x.name, pptNumber(x.value)])];
+  pptTable(slide, costRows, { x: 0.65, y: 1.52, w: 5.9, colW: [4.4, 1.5], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 7.2, headerFontSize: 7.8, margin: 0.028, rowH: 0.23, autoFit: false });
+  const marketingRows = [
+    ['营销类别','年度金额','权重'],
+    ...(result.marketingAllocation || []).map(x => [x.name, pptNumber(x.amount), pptPercent(x.share)]),
+    ...(result.openingMarketingAllocation || []).map(x => [`开业·${x.name}`, pptNumber(x.amount), `首年 ${pptPercent(x.share)}`]),
+  ];
+  pptTable(slide, marketingRows, { x: 6.8, y: 1.55, w: 5.8, colW: [2.95, 1.35, 1.5], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 7.8, margin: 0.035, rowH: 0.36, autoFit: false });
+  pptInsightBar(slide, {
+    x: 6.8, y: 4.38, w: 5.8, h: 1.08,
+    title: '年度汇总',
+    body: `年度营销 ${pptNumber(result.summary.stableMarketingCost)} 万元｜开业首年 ${pptNumber(result.summary.firstYearMarketingCost)} 万元｜办公 ${pptNumber(result.summary.stableOfficeCost)} 万元｜招商 ${pptNumber(result.summary.stableLeasingCost)} 万元｜维保 ${pptNumber(result.summary.stableMaintenanceCost)} 万元`,
+    accent: PPT_THEME.gold, fill: PPT_THEME.cream,
+  });
+  slide.addText('成本明细按稳定运营年展示；开业首年营销另列，避免与稳定年营销重复计算。', { x: 0.65, y: 6.55, w: 5.9, h: 0.28, fontFace: PPT_FONT, fontSize: 7.2, color: PPT_THEME.muted, breakLine: false });
+
+  const detection = result.model.market?.lastAnalysis || {};
+  const detectionSubtitle = [`综合评分 ${pptNumber(detection.detectionScore || 0)}/100`, detection.marketGrade || '待评估', detection.competitionLevel || ''].filter(Boolean).join('｜');
+  slide = addContentSlide('3–5公里商业侦测', detectionSubtitle);
+  const ringStats = Array.isArray(detection.ringStats) ? detection.ringStats : [];
+  const detectionConclusions = Array.isArray(detection.conclusions) ? detection.conclusions.filter(Boolean) : [];
+  const detectionOpportunities = Array.isArray(detection.opportunities) ? detection.opportunities.filter(Boolean) : [];
+  const hasDetection = ringStats.length > 0 || Number(detection.commercialCount || 0) > 0 || detectionConclusions.some(x => !String(x).includes('尚未')) || detectionOpportunities.length > 0;
+  if (hasDetection) {
+    slide.addText(`商业POI ${detection.commercialCount || 0}｜直接竞品 ${detection.competitorCount || 0}｜商业锚点 ${detection.anchorCount || 0}｜交通配套 ${detection.transportCount || 0}｜居住社区 ${detection.residentialCount || 0}`, { x: 0.7, y: 1.35, w: 12.0, h: 0.45, fontFace: PPT_FONT, fontSize: 9.5, color: PPT_THEME.text, fill: { color: PPT_THEME.greenSoft }, margin: 0.1, breakLine: false });
+    const ringRows = [['圈层','商业POI','直接竞品','交通配套','居住片区','业态数'], ...ringStats.map(x => [x.label, x.commercialCount, x.competitorCount, x.transportCount, x.residentialCount, x.categoryCount])];
+    pptTable(slide, ringRows, { x: 0.7, y: 1.95, w: 5.8, colW: [1.2, 1.0, 1.0, 1.0, 1.0, 0.8], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 8, margin: 0.04, rowH: 0.52, autoFit: false });
+    const detectionText = `侦测结论\n${detectionConclusions.map(x => `• ${x}`).join('\n')}${detectionOpportunities.length ? `\n\n商业机会\n${detectionOpportunities.map(x => `• ${x}`).join('\n')}` : ''}`;
+    slide.addText(detectionText, { x: 6.8, y: 1.95, w: 5.8, h: 4.1, fontFace: PPT_FONT, fontSize: 9, color: PPT_THEME.text, fill: { color: PPT_THEME.cream }, margin: 0.14, valign: 'top', breakLine: false });
+  } else {
+    slide.addShape('roundRect', { x: 0.7, y: 1.4, w: 4.0, h: 4.55, radius: 0.08, fill: { color: PPT_THEME.greenSoft }, line: { color: 'C9DDD4', width: 0.6 } });
+    slide.addText('0.00', { x: 0.95, y: 2.0, w: 3.5, h: 0.7, fontFace: PPT_FONT, fontSize: 38, bold: true, color: PPT_THEME.navy, align: 'center', margin: 0, breakLine: false });
+    slide.addText('/ 100', { x: 0.95, y: 2.78, w: 3.5, h: 0.3, fontFace: PPT_FONT, fontSize: 12, color: PPT_THEME.muted, align: 'center', margin: 0, breakLine: false });
+    slide.addText('尚未完成商业侦测', { x: 0.95, y: 3.25, w: 3.5, h: 0.3, fontFace: PPT_FONT, fontSize: 11, bold: true, color: PPT_THEME.navy, align: 'center', margin: 0, breakLine: false });
+    slide.addShape('roundRect', { x: 5.0, y: 1.4, w: 7.6, h: 4.55, radius: 0.08, fill: { color: PPT_THEME.cream }, line: { color: PPT_THEME.line, width: 0.6 } });
+    slide.addText('需要补充的数据', { x: 5.28, y: 1.68, w: 4.0, h: 0.28, fontFace: PPT_FONT, fontSize: 12, bold: true, color: PPT_THEME.navy, margin: 0, breakLine: false });
+    const nextSteps = [
+      ['01', '导入3–5公里竞品租金样本', '至少包含项目名称、业态、楼层、可租赁面积和月租金。'],
+      ['02', '完成公开地图商业侦测', '记录商业POI、直接竞品、商业锚点、交通配套和居住社区。'],
+      ['03', '复核样本口径', '统一为元/㎡/月，并保留样本日期、来源和数据可信度。'],
+    ];
+    nextSteps.forEach((item, index) => {
+      const y = 2.2 + index * 1.05;
+      slide.addText(item[0], { x: 5.3, y, w: 0.45, h: 0.3, fontFace: PPT_FONT, fontSize: 13, bold: true, color: PPT_THEME.gold, margin: 0, breakLine: false });
+      slide.addText(item[1], { x: 5.9, y, w: 5.9, h: 0.28, fontFace: PPT_FONT, fontSize: 10.5, bold: true, color: PPT_THEME.text, margin: 0, breakLine: false });
+      slide.addText(item[2], { x: 5.9, y: y + 0.34, w: 5.9, h: 0.34, fontFace: PPT_FONT, fontSize: 8.5, color: PPT_THEME.muted, margin: 0, breakLine: false });
+    });
+  }
+  slide.addText('公开地图数据不含人口、销售额和授权租金，正式决策需结合实地客流、租户访谈和授权市场数据。', { x: 0.7, y: 6.35, w: 11.9, h: 0.34, fontFace: PPT_FONT, fontSize: 7.8, color: PPT_THEME.muted, breakLine: false });
+
+  slide = addContentSlide('项目租金与市场位置', '项目租金与竞品租金统一定义为“租金单价”，金额保留两位小数');
+  const ms = result.marketSummary || {};
+  const projectRentArea = (result.floors || []).reduce((sum, x) => sum + Number(x.rentArea || 0), 0);
+  const fallbackProjectRent = projectRentArea > 0 ? Number(s.totalMonthlyRent || 0) / projectRentArea : 0;
+  const projectRent = Number(ms.projectAverageRent) > 0 ? Number(ms.projectAverageRent) : fallbackProjectRent;
+  const marketRentText = value => Number(value) > 0 ? `${pptNumber(value)} 元/㎡/月` : '暂无样本';
+  pptMetricCard(slide, { x: 0.7, y: 1.48, w: 3.8, h: 1.2, label: '项目租金单价', value: marketRentText(projectRent), note: '项目满租月租金 ÷ 项目计租面积', fill: PPT_THEME.greenSoft, line: 'C9DDD4' });
+  pptMetricCard(slide, { x: 4.75, y: 1.48, w: 3.8, h: 1.2, label: '市场加权均价', value: marketRentText(ms.weightedAverageRent), note: '竞品按可租赁面积加权', fill: PPT_THEME.goldSoft, line: 'E9D6AC' });
+  pptMetricCard(slide, { x: 8.8, y: 1.48, w: 3.8, h: 1.2, label: '市场中位数', value: marketRentText(ms.medianRent), note: '竞品租金样本中位数', fill: PPT_THEME.cream, line: PPT_THEME.line });
+  const marketConclusions = Array.isArray(ms.conclusions) && ms.conclusions.length ? ms.conclusions : ['尚未导入竞品租金样本，当前以项目自身租金和行业基准进行校验。'];
+  pptInsightBar(slide, { x: 0.7, y: 3.0, w: 11.9, h: 0.82, title: '市场位置', body: `当前判断：${ms.position || '暂无竞品样本，无法形成市场位置判断'}` , accent: PPT_THEME.green, fill: PPT_THEME.greenSoft });
+  if (Number(ms.count || 0) > 0) {
+    const marketConclusionText = marketConclusions.map((x, i) => `${i + 1}. ${x}`).join('\n\n');
+    slide.addText(marketConclusionText, { x: 0.85, y: 4.15, w: 11.5, h: 1.9, fontFace: PPT_FONT, fontSize: 10.2, color: PPT_THEME.text, breakLine: false, valign: 'top', margin: 0.05 });
+  } else {
+    const marketNeeds = [
+      ['竞品租金', '至少导入3–5个有效样本'],
+      ['样本面积', '填写可租赁面积以形成加权均价'],
+      ['统一口径', '全部换算为元/㎡/月并保留来源'],
+    ];
+    marketNeeds.forEach((item, i) => {
+      pptMetricCard(slide, { x: 0.7 + i * 4.05, y: 4.15, w: 3.8, h: 0.95, label: item[0], value: item[1], valueFontSize: 10.5, fill: PPT_THEME.cream, line: PPT_THEME.line });
+    });
+    slide.addText(marketConclusions[0], { x: 0.85, y: 5.35, w: 11.5, h: 0.7, fontFace: PPT_FONT, fontSize: 9, color: PPT_THEME.muted, breakLine: false, valign: 'top' });
+  }
+
+  slide = addContentSlide('NPV敏感性分析', '租金与投资同时变动时的项目NPV（万元）');
+  const matrixRows = [['租金↓ / 投资→', ...(result.sensitivity.capexSteps || []).map(v => `${(v * 100).toFixed(0)}%`)], ...(result.sensitivity.rentSteps || []).map((rent, i) => [`${(rent * 100).toFixed(0)}%`, ...(result.sensitivity.npvMatrix[i] || []).map(v => v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))])];
+  pptTable(slide, matrixRows, { x: 1.15, y: 1.55, w: 10.9, colW: [2.0, 1.75, 1.75, 1.75, 1.75, 1.75], border: { color: 'D9E1F2', width: 0.5 }, fill: 'FFFFFF', color: '17211E', fontFace: PPT_FONT, fontSize: 10, align: 'center', valign: 'mid', margin: 0.06, rowH: 0.46 });
+
+  slide = addContentSlide('测算公式（一）', '面积、租金、投资与运营成本');
+  pptTable(slide, [
+    ['模块', '公式', '使用函数'],
+    ['面积', 'GBA = 手动值；若为0：一铺一价=商铺面积×(1+公区系数)，初步测算=楼层建筑面积合计', 'IF / SUM'],
+    ['租金', '有效出租率 = IF(首年, 首年最低出租率, IF(稳定前, 第二年出租率, 稳定出租率))', 'IF'],
+    ['租金', '租金收入 = 满租月租金×12×出租率×免租系数×租金递增因子', 'POWER / INT / SUM'],
+    ['租金', '阶段租金 = 满租月租金×12×阶段出租率×免租系数×基础递增因子×(1+阶段调整率)', 'IF / POWER / INT / SUM'],
+    ['物业费', '物业管理费收入 = Σ计租面积×物业费单价×12×出租率×物业费递增因子', 'POWER / INT / SUM'],
+    ['商管费', '商业管理费收入 = Σ计租面积×商管费单价×12×出租率×商管费递增因子', 'POWER / INT / SUM'],
+    ['空调费', '中央空调费收入 = Σ开启楼栋计租面积×楼栋空调单价×12×出租率×空调费递增因子', 'IF / POWER / INT / SUM'],
+    ['联营', '测算收入 = IF(纯租金, 保底, IF(纯扣点, 扣点, MAX(保底,扣点)))', 'IF / MAX'],
+    ['投资', '分项工程投资 = 总建筑面积×分项单价÷10000', 'SUM / ROUND'],
+    ['投资', '预备费 = 直接工程费×预备费率', 'SUM'],
+    ['运营', 'NOI = 不含税收入 - 不含税运营成本 - 税费', 'SUM / MIN / MAX'],
+  ], { x: 0.7, y: 1.35, w: 12.0, colW: [1.2, 8.7, 2.1], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 8, headerFontSize: 8.6, margin: 0.04, rowH: 0.38, autoFit: false });
+
+  slide = addContentSlide('测算公式（二）', '税费、融资、折旧、现金流与收益指标');
+  pptTable(slide, [
+    ['模块', '公式', '使用函数'],
+    ['税费', '销项税 = Σ[商户含税收入÷(1+税率)×税率]；进项税 = MIN(销项税, 业主租金专票进项 + 其他可抵扣成本进项)', 'SUM / MIN'],
+    ['房产税', 'IF(从租, 不含税租金×12%, 房产原值×(1-扣除比例)×1.2%)', 'IF'],
+    ['融资', '贷款利息 = (期初余额+当年提款÷2)×年利率；等额本金=贷款额÷期限', 'IF / MIN'],
+    ['折旧', '年折旧 = 建筑投资÷年限 + 装修投资÷年限 + 设备投资÷年限', 'SUM'],
+    ['所得税', '项目所得税=MAX(0,EBIT-项目亏损)×税率；股权所得税=MAX(0,EBIT-利息-亏损)×税率', 'MAX / IF'],
+    ['现金流', '项目CF=NOI-资本化改造-项目所得税+退出价值；股权CF=NOI-资本化改造-股权所得税-利息-本金+退出价值', 'SUM / IF'],
+    ['收益', 'NPV = Σ[CFt÷(1+r)^t]；IRR：NPV(IRR)=0；回收期按累计CF插值', 'NPV / IRR / LOOKUP'],
+    ['敏感性', 'NPV=f(租金系数,投资系数)，在MIN~MAX间按STEP生成矩阵', 'SEQUENCE / NPV'],
+  ], { x: 0.7, y: 1.38, w: 12.0, colW: [1.2, 8.7, 2.1], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 8.6, headerFontSize: 9, margin: 0.045, rowH: 0.44, autoFit: false });
+
+  slide = addContentSlide('函数与公式注解', '语法、含义和调整时应注意的事项');
+  const functionRows = [['函数', '语法与含义', '调整注意'], ...Object.entries(EXPORT_FUNCTIONS).map(([name, f]) => [name, `${f.syntax}\n${f.meaning}`, f.note])];
+  pptTable(slide, functionRows, { x: 0.7, y: 1.36, w: 12.0, colW: [1.3, 6.7, 4.0], border: { color: PPT_THEME.line, width: 0.5 }, fill: 'FFFFFF', color: PPT_THEME.text, fontFace: PPT_FONT, fontSize: 7.2, headerFontSize: 7.9, margin: 0.032, rowH: 0.32, autoFit: false });
+
+  slide = addContentSlide('分析结论与行动建议', '供内部评审和下一步决策使用');
+  const analysisBullets = (result.analysis.bullets || []).map(x => `• ${pptNormalizeNumberText(x)}`).join('\n\n') || '暂无测算结论';
+  const recommendations = (result.analysis.recommendations || []).map((x, i) => `${i + 1}. ${pptNormalizeNumberText(x)}`).join('\n\n') || '暂无行动建议';
+  slide.addShape('roundRect', { x: 0.7, y: 1.4, w: 5.9, h: 5.28, radius: 0.06, fill: { color: PPT_THEME.cream }, line: { color: PPT_THEME.line, width: 0.5 } });
+  slide.addShape('roundRect', { x: 6.75, y: 1.4, w: 5.9, h: 5.28, radius: 0.06, fill: { color: PPT_THEME.goldSoft }, line: { color: 'E9D6AC', width: 0.5 } });
+  slide.addText('测算结论', { x: 0.95, y: 1.62, w: 3.5, h: 0.28, fontFace: PPT_FONT, fontSize: 11, bold: true, color: PPT_THEME.green, margin: 0, breakLine: false });
+  slide.addText('行动建议', { x: 7.0, y: 1.62, w: 3.5, h: 0.28, fontFace: PPT_FONT, fontSize: 11, bold: true, color: '76591C', margin: 0, breakLine: false });
+  slide.addText(analysisBullets, { x: 0.95, y: 2.05, w: 5.35, h: 4.35, fontFace: PPT_FONT, fontSize: 9.6, color: PPT_THEME.text, breakLine: false, valign: 'top', margin: 0.02 });
+  slide.addText(recommendations, { x: 7.0, y: 2.05, w: 5.35, h: 4.35, fontFace: PPT_FONT, fontSize: 9.3, color: PPT_THEME.text, breakLine: false, valign: 'top', margin: 0.02 });
+
+  const output = await pptx.write({ outputType: 'blob' });
+  if (!window.JSZip) return output instanceof Blob ? output : new Blob([output], { type: PPTX_MIME });
+  const bytes = output instanceof Blob ? await output.arrayBuffer() : output;
+  const zip = await window.JSZip.loadAsync(bytes);
+  for (const name of Object.keys(zip.files)) {
+    if (/^ppt\/(slides\/slide|charts\/chart)\d+\.xml$/.test(name)) {
+      let xml = await zip.file(name).async('string');
+      xml = xml.replace(/typeface="Arial"/g, `typeface="${PPT_FONT}"`).replace(/lang="en-US"/g, 'lang="zh-CN"');
+      zip.file(name, xml);
+    }
+  }
+  const contentTypesFile = zip.file('[Content_Types].xml');
+  if (contentTypesFile) {
+    let contentTypes = await contentTypesFile.async('string');
+    contentTypes = contentTypes.replace(/<Override PartName="\/ppt\/slideMasters\/slideMaster(?:[2-9]|1[0-6])\.xml" ContentType="[^"]+"\/>/g, '');
+    zip.file('[Content_Types].xml', contentTypes);
+  }
+  const patched = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', mimeType: PPTX_MIME });
+  return patched;
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const r = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function classifyPOI(tags) {
+  const shop = tags.shop;
+  const amenity = tags.amenity;
+  const leisure = tags.leisure;
+  const office = tags.office;
+  if (shop === 'mall') return '购物中心';
+  if (shop === 'department_store') return '百货商场';
+  if (['supermarket', 'convenience', 'grocery', 'greengrocer'].includes(shop)) return '超市便利';
+  if (amenity === 'marketplace') return '传统市场';
+  if (['clothes', 'shoes', 'jewelry', 'cosmetics', 'electronics', 'furniture', 'sports', 'books', 'toys', 'gift', 'bags', 'watches'].includes(shop)) return '零售商业';
+  if (['restaurant', 'cafe', 'fast_food', 'food_court', 'ice_cream'].includes(amenity)) return '餐饮';
+  if (amenity === 'cinema') return '影院';
+  if (['fitness_centre', 'sports_centre'].includes(leisure)) return '健身运动';
+  if (['hotel', 'guest_house'].includes(tags.tourism)) return '酒店';
+  if (['bank', 'atm', 'bureau_de_change'].includes(amenity)) return '银行金融';
+  if (['pharmacy', 'hospital', 'clinic', 'doctors', 'dentist'].includes(amenity)) return '医疗健康';
+  if (['school', 'college', 'university', 'kindergarten'].includes(amenity)) return '教育培训';
+  if (['parking', 'fuel', 'charging_station'].includes(amenity)) return '停车交通';
+  if (['bus_station', 'taxi'].includes(amenity) || tags.public_transport || ['station', 'subway_entrance'].includes(tags.railway)) return '公共交通';
+  if (['park', 'playground'].includes(leisure)) return '公园休闲';
+  if (office || ['coworking', 'company'].includes(office)) return '商务办公';
+  if (shop || amenity === 'post_office' || amenity === 'laundry' || amenity === 'hairdresser') return '生活服务';
+  if (tags.building === 'residential' || tags.landuse === 'residential') return '住宅社区';
+  return null;
+}
+
+const COMMERCIAL_CATEGORIES = new Set(['购物中心','百货商场','超市便利','传统市场','零售商业','餐饮','影院','健身运动','酒店','银行金融','生活服务','商务办公']);
+const TRANSPORT_CATEGORIES = new Set(['公共交通','停车交通']);
+const SUPPORT_CATEGORIES = new Set(['医疗健康','教育培训','公园休闲','住宅社区']);
+
+const LIUZHOU_MARKET = {
+  provider: 'OpenStreetMap Overpass（缓存演示）',
+  center: { lat: 24.341202, lon: 109.430294 },
+  radiusKm: 3,
+  totalPoi: 35,
+  commercialCount: 35,
+  competitorCount: 11,
+  anchorCount: 9,
+  transportCount: 0,
+  supportCount: 0,
+  residentialCount: 0,
+  densityPerKm2: 1.2,
+  detectionScore: 58,
+  marketGrade: 'C级培育商圈',
+  competitionLevel: '商业供给密集',
+  ringStats: [
+    {label:'0–1公里',minKm:0,maxKm:1,totalPoi:8,commercialCount:8,competitorCount:3,transportCount:0,residentialCount:0,categoryCount:4},
+    {label:'1–3公里',minKm:1,maxKm:3,totalPoi:27,commercialCount:27,competitorCount:8,transportCount:0,residentialCount:0,categoryCount:6},
+    {label:'3–5公里',minKm:3,maxKm:5,totalPoi:0,commercialCount:0,competitorCount:0,transportCount:0,residentialCount:0,categoryCount:0}
+  ],
+  conclusions: ['3公里范围内识别到35个相关商业POI，直接竞品约11个。','商业供给较密集，建议通过业态组合、品牌和场景体验形成差异化。'],
+  opportunities: ['可结合竞品租金样本和实地客流进一步寻找餐饮、体验和生活服务的差异化机会。'],
+  categories: [
+    { name: '健身运动', count: 11 }, { name: '餐饮', count: 7 }, { name: '传统市场', count: 7 },
+    { name: '酒店', count: 4 }, { name: '购物中心', count: 4 }, { name: '影院', count: 2 },
+  ],
+  competitors: [
+    { name: '柳柴赏石文化产业园', category: '传统市场', distanceKm: 1.7 },
+    { name: '王府井购物中心', category: '购物中心', distanceKm: null },
+    { name: '保利商业广场', category: '购物中心', distanceKm: 2.0 },
+    { name: '金东花卉市场', category: '传统市场', distanceKm: 2.2 },
+    { name: '万象城', category: '购物中心', distanceKm: 2.4 },
+    { name: '顺兴达花鸟市场', category: '传统市场', distanceKm: 2.6 },
+  ],
+  summary: '3公里范围内识别到35个相关商业POI，其中购物中心、百货、超市和传统市场等直接竞品约11个。',
+  coverageNote: '当前为已缓存的演示数据；正式决策应结合最新实地踏勘和授权市场数据库。',
+};
+
+async function marketAnalysis(lat, lon, radiusKm) {
+  const radiusM = Math.round(radiusKm * 1000);
+  const query = `[out:json][timeout:35];(
+    nwr["shop"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    nwr["amenity"~"restaurant|cafe|fast_food|food_court|ice_cream|cinema|marketplace|bank|atm|bureau_de_change|pharmacy|hospital|clinic|doctors|dentist|school|college|university|kindergarten|bus_station|taxi|parking|fuel|charging_station|post_office|laundry|hairdresser"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    nwr["leisure"~"fitness_centre|sports_centre|park|playground"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    nwr["tourism"~"hotel|guest_house|attraction"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    nwr["office"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    nwr["public_transport"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    nwr["railway"~"station|subway_entrance"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    way["landuse"="residential"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    relation["landuse"="residential"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    way["building"="residential"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+    relation["building"="residential"](around:${radiusM},${lat.toFixed(7)},${lon.toFixed(7)});
+  );out tags center;`;
+  const endpoints = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.nchc.org.tw/api/interpreter',
+  ];
+  let payload = null;
+  let lastError = null;
+  for (const endpoint of endpoints) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 18000);
+    try {
+      const response = await nativeFetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'Accept': 'application/json' },
+        body: new URLSearchParams({ data: query }).toString(),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      payload = await response.json();
+      break;
+    } catch (error) {
+      lastError = error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (!payload) {
+    if (Math.abs(lat - 24.341202) < 0.05 && Math.abs(lon - 109.430294) < 0.05) {
+      const fallback = { ...LIUZHOU_MARKET };
+      fallback.requestedRadiusKm = radiusKm;
+      fallback.effectiveRadiusKm = 3;
+      fallback.fallbackUsed = radiusKm !== 3;
+      fallback.coverageNote = `实时数据源暂时不可用，当前展示柳州项目缓存侦测结果。${lastError ? String(lastError.message || lastError) : ''}`;
+      return fallback;
+    }
+    throw new Error(`周边商业侦测服务暂时不可用：${lastError?.message || '全部数据节点无响应'}`);
+  }
+
+  const counts = {};
+  const competitors = [];
+  const namedPois = [];
+  const ringDefs = [
+    { label: '0–1公里', min: 0, max: 1 },
+    { label: '1–3公里', min: 1, max: 3 },
+    { label: '3–5公里', min: 3, max: 5 },
+  ];
+  const rings = ringDefs.map(item => ({ ...item, total: 0, commercial: 0, competitors: 0, transport: 0, residential: 0, categories: new Set() }));
+  const seen = new Set();
+  for (const element of payload.elements || []) {
+    const key = `${element.type}:${element.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const tags = element.tags || {};
+    const category = classifyPOI(tags);
+    if (!category) continue;
+    const center = element.center || {};
+    const poiLat = center.lat ?? element.lat;
+    const poiLon = center.lon ?? element.lon;
+    const distanceKm = poiLat != null && poiLon != null ? haversineKm(lat, lon, Number(poiLat), Number(poiLon)) : null;
+    if (distanceKm != null && distanceKm > radiusKm) continue;
+    counts[category] = (counts[category] || 0) + 1;
+    const ring = rings.find(item => distanceKm != null && distanceKm <= item.max && distanceKm > item.min) || rings[0];
+    ring.total += 1;
+    ring.categories.add(category);
+    if (COMMERCIAL_CATEGORIES.has(category)) ring.commercial += 1;
+    if (TRANSPORT_CATEGORIES.has(category)) ring.transport += 1;
+    if (category === '住宅社区') ring.residential += 1;
+    const name = tags.name || tags['name:zh'] || tags['name:en'] || '';
+    const record = { name: name || '', category, distanceKm, lat: poiLat, lon: poiLon };
+    if (name) namedPois.push(record);
+    if (['购物中心', '百货商场', '超市便利', '传统市场'].includes(category)) {
+      ring.competitors += 1;
+      if (name) competitors.push(record);
+    }
+  }
+  const commercialCount = Object.entries(counts).reduce((sum, [name, count]) => sum + (COMMERCIAL_CATEGORIES.has(name) ? count : 0), 0);
+  const competitorCount = ['购物中心', '百货商场', '超市便利', '传统市场'].reduce((sum, name) => sum + (counts[name] || 0), 0);
+  const transportCount = ['公共交通', '停车交通'].reduce((sum, name) => sum + (counts[name] || 0), 0);
+  const supportCount = ['医疗健康', '教育培训', '公园休闲', '住宅社区', '银行金融'].reduce((sum, name) => sum + (counts[name] || 0), 0);
+  const residentialCount = counts['住宅社区'] || 0;
+  const anchorCount = ['购物中心', '百货商场', '影院', '酒店'].reduce((sum, name) => sum + (counts[name] || 0), 0);
+  const density = radiusKm > 0 ? commercialCount / (Math.PI * radiusKm * radiusKm) : 0;
+  const diversity = Object.keys(counts).length;
+  const supplyScore = Math.min(24, commercialCount * 0.55);
+  const anchorScore = Math.min(18, anchorCount * 2.2);
+  const transportScore = Math.min(15, transportCount * 1.4);
+  const supportScore = Math.min(15, supportCount * 0.45);
+  const residentialScore = Math.min(10, residentialCount * 0.35);
+  const diversityScore = Math.min(10, diversity * 1.1);
+  const densityScore = Math.min(8, density * 3.0);
+  const detectionScore = Math.round(Math.min(100, supplyScore + anchorScore + transportScore + supportScore + residentialScore + diversityScore + densityScore));
+  const marketGrade = detectionScore >= 78 ? 'A级成熟商圈' : detectionScore >= 62 ? 'B级成长商圈' : detectionScore >= 46 ? 'C级培育商圈' : 'D级远端/潜力商圈';
+  const competitionLevel = competitorCount >= 18 || commercialCount >= 120 ? '商业供给高度密集' : competitorCount >= 10 || commercialCount >= 70 ? '商业供给密集' : competitorCount >= 5 ? '中等竞争' : '竞争相对有限';
+  const sortedCompetitors = competitors.sort((a, b) => (a.distanceKm ?? 9999) - (b.distanceKm ?? 9999)).slice(0, 30);
+  const conclusions = [];
+  conclusions.push(`3公里内识别到${commercialCount}个商业类POI、${competitorCount}个直接竞品、${anchorCount}个商业锚点。`);
+  if (competitionLevel.includes('密集')) conclusions.push('周边直接竞品密集，项目需要明确差异化定位，避免仅以租金竞争。');
+  else if (competitionLevel === '竞争相对有限') conclusions.push('直接竞品相对有限，但仍需验证有效客流和消费支撑。');
+  else conclusions.push('周边形成一定商业集聚，需要通过业态组合和品质形成差异化。');
+  if (transportCount < 5) conclusions.push('公共交通和停车配套识别数量偏少，建议补充实地交通与停车调查。');
+  else conclusions.push(`识别到${transportCount}个公交、轨道或停车配套，交通可达性具备一定基础。`);
+  if (residentialCount < 8) conclusions.push('公开地图住宅社区识别数量偏少，人口和消费数据需通过授权数据源补充。');
+  else conclusions.push(`识别到${residentialCount}个住宅社区/居住片区，具备一定社区消费基础。`);
+  const opportunities = [];
+  if (residentialCount >= 15) opportunities.push('居住社区密集，可重点布局社区餐饮、亲子、生活服务和日常零售。');
+  if (transportCount >= 12) opportunities.push('交通节点较多，可强化目的性业态和周末客流转化。');
+  if ((counts['餐饮'] || 0) > (counts['零售商业'] || 0)) opportunities.push('餐饮POI占比较高，项目可考虑差异化零售、体验和服务组合。');
+  if (anchorCount < 3) opportunities.push('周边大型商业锚点不足，存在承接区域消费的窗口。');
+  if (!opportunities.length) opportunities.push('可结合竞品租金样本、租户访谈和实地客流进一步寻找切入点。');
+  const ringStats = rings.map(item => ({
+    label: item.label,
+    minKm: item.min,
+    maxKm: item.max,
+    totalPoi: item.total,
+    commercialCount: item.commercial,
+    competitorCount: item.competitors,
+    transportCount: item.transport,
+    residentialCount: item.residential,
+    categoryCount: item.categories.size,
+  }));
+  return {
+    provider: 'OpenStreetMap Overpass 多节点侦测',
+    center: { lat, lon },
+    radiusKm,
+    totalPoi: Object.values(counts).reduce((a, b) => a + b, 0),
+    commercialCount,
+    competitorCount,
+    anchorCount,
+    transportCount,
+    supportCount,
+    residentialCount,
+    densityPerKm2: density,
+    detectionScore,
+    marketGrade,
+    competitionLevel,
+    categories: Object.entries(counts).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count),
+    competitors: sortedCompetitors,
+    namedPois: namedPois.sort((a, b) => (a.distanceKm ?? 9999) - (b.distanceKm ?? 9999)).slice(0, 50),
+    ringStats,
+    conclusions,
+    opportunities,
+    summary: `${radiusKm}公里范围内识别到${commercialCount}个商业POI，其中直接竞品约${competitorCount}个；综合商业侦测评分${detectionScore}/100，判定为${marketGrade}。`,
+    coverageNote: '本侦测基于公开地图POI和交通、居住、公共配套数据，不含人口、销售额和授权租金数据；正式决策应结合实地踏勘、客流调研和授权商业数据库。',
+    detectionAt: new Date().toISOString(),
+  };
+}
+async function geocode(query) {
+  const coord = query.match(/^\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (coord) return { results: [{ displayName: `${coord[1]}, ${coord[2]}`, lat: Number(coord[1]), lon: Number(coord[2]) }] };
+  const known = { '柳州': [24.3264, 109.4281], '南宁': [22.8170, 108.3665], '桂林': [25.2736, 110.2900], '北海': [21.4811, 109.1202], '梧州': [23.4769, 111.2791] };
+  const q = String(query || '');
+  const fallbackKey = Object.keys(known).find(k => q.includes(k));
+  try {
+    const response = await nativeFetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&accept-language=zh-CN&q=${encodeURIComponent(q)}`, {
+      headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout ? AbortSignal.timeout(18000) : undefined,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const rows = await response.json();
+    return { results: rows.map(x => ({ displayName: x.display_name, lat: Number(x.lat), lon: Number(x.lon) })) };
+  } catch (error) {
+    if (fallbackKey) return { results: [{ displayName: `${fallbackKey}（离线参考坐标，请在地图中微调）`, lat: known[fallbackKey][0], lon: known[fallbackKey][1] }] };
+    throw new Error('地址服务暂时不可用，可直接输入“纬度,经度”或在地图中手动选点');
+  }
+}
+
+async function reverseGeocode(lat, lon) {
+  try {
+    const response = await nativeFetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&accept-language=zh-CN`, { headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout ? AbortSignal.timeout(18000) : undefined });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    return { displayName: payload.display_name || `${lat.toFixed(6)}, ${lon.toFixed(6)}` };
+  } catch {
+    return { displayName: `${Number(lat).toFixed(6)}, ${Number(lon).toFixed(6)}` };
+  }
+}
+
+async function cloudLoginIdentity(username, password, options = {}) {
+  const auth = await cloudJSON('/auth/v1/token?grant_type=password', {
+    method: 'POST',
+    body: { email: await usernameEmail(username), password },
+    token: CLOUD_CONFIG.anonKey,
+    timeoutMs: Number(options.timeoutMs || 30000),
+    retries: Number(options.retries || 4),
+  });
+  if (!auth?.access_token || !auth?.user?.id) throw new Error('登录响应不完整，请稍后重试');
+  const profile = await cloudProfileWithToken(auth.access_token, auth.user.id);
+  if (!profile) throw Object.assign(new Error('账号资料尚未建立，请联系超级管理员'), { status: 403 });
+  return { auth, profile };
+}
+
+async function cloudRegisterIdentity(username, password, displayName) {
+  const health = await cloudRequest('/auth/v1/health', {
+    token: CLOUD_CONFIG.anonKey,
+      timeoutMs: 30000,
+      retries: 4,
+  });
+  if (!health.ok) throw Object.assign(new Error(`云端注册服务暂时不可用（HTTP ${health.status}）`), { status: 503, code: 'CLOUD_UNAVAILABLE' });
+  const auth = await cloudJSON('/auth/v1/signup', {
+    method: 'POST',
+    body: {
+      email: await usernameEmail(username),
+      password,
+      data: { username, display_name: displayName || username },
+    },
+    token: CLOUD_CONFIG.anonKey,
+    timeoutMs: 30000,
+    retries: 4,
+  });
+  if (!auth?.access_token || !auth?.user?.id) return { pending: true, auth: null, profile: null };
+  const profile = await cloudProfileWithToken(auth.access_token, auth.user.id);
+  if (profile?.status === 'approved') return { pending: false, auth, profile };
+  await cloudRequest('/auth/v1/logout', { method: 'POST', token: auth.access_token }).catch(() => {});
+  return { pending: true, auth: null, profile };
+}
+
+async function cloudIdentitySessionPayload(auth, profile, extra = {}) {
+  storeCloudSession(auth, { username: profile.username, displayName: profile.display_name });
+  await cloudJSON('/rest/v1/rpc/record_login', { method: 'POST', body: {}, token: auth.access_token }).catch(() => {});
+  return {
+    token: auth.access_token,
+    user: {
+      id: profile.id,
+      username: profile.username,
+      displayName: profile.display_name || profile.username,
+      role: normalizeUserRole(profile.role),
+      status: profile.status,
+      isCloud: true,
+      localMode: false,
+      ...extra,
+    },
+    ...extra,
+  };
+}
+
+async function handleApi(path, init) {
+  const method = String(init?.method || 'GET').toUpperCase();
+  const url = new URL(path, location.href);
+  const pathname = url.pathname;
+
+  if (pathname.endsWith('/api/login') && method === 'POST') {
+    const body = await requestJSON(init);
+    const username = normalizeUsername(body.username);
+    const password = String(body.password || '');
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '云端账号服务尚未配置' }, 503);
+    try {
+      const auth = await cloudJSON('/auth/v1/token?grant_type=password', {
+        method: 'POST',
+        body: { email: await usernameEmail(username), password },
+        token: CLOUD_CONFIG.anonKey,
+        timeoutMs: 30000,
+        retries: 4,
+      });
+      if (!auth?.access_token || !auth?.user?.id) throw new Error('登录响应不完整，请稍后重试');
+      const profile = await cloudProfileWithToken(auth.access_token, auth.user.id);
+      if (!profile) throw Object.assign(new Error('账号资料尚未建立，请联系超级管理员'), { status: 403 });
+      if (profile.status !== 'approved') {
+        await cloudRequest('/auth/v1/logout', { method: 'POST', token: auth.access_token }).catch(() => {});
+        const messages = {
+          pending: '账号已注册，正在等待超级管理员审核授权',
+          rejected: '账号审核未通过，请联系超级管理员',
+          disabled: '账号已被停用，请联系超级管理员',
+        };
+        return jsonResponse({ error: messages[profile.status] || '账号当前不可用', code: 'ACCOUNT_' + profile.status.toUpperCase(), status: profile.status }, 403);
+      }
+      storeCloudSession(auth, { username: profile.username, displayName: profile.display_name });
+      await cloudJSON('/rest/v1/rpc/record_login', { method: 'POST', body: {}, token: auth.access_token }).catch(() => {});
+      return jsonResponse({
+        token: auth.access_token,
+        user: {
+          id: profile.id,
+          username: profile.username,
+          displayName: profile.display_name || profile.username,
+          role: normalizeUserRole(profile.role),
+          status: profile.status,
+          isCloud: true,
+        },
+      });
+    } catch (error) {
+      if (username === 'demo' && (error.status === 400 || error.status === 401)) {
+        try {
+          const registered = await cloudRegisterIdentity(username, password, '演示用户');
+          if (!registered.pending) {
+            return jsonResponse(await cloudIdentitySessionPayload(registered.auth, registered.profile, { cloudRegistered: true }));
+          }
+          return jsonResponse({ error: '演示账号云端初始化失败，请稍后重试' }, 503);
+        } catch (registerError) {
+          console.warn('演示账号云端初始化失败', registerError);
+        }
+      }
+      if (error.status === 403) return jsonResponse({ error: error.message, code: error.code || '', status: error.accountStatus || '' }, 403);
+      if (error.code === 'CLOUD_NETWORK' || error.code === 'CLOUD_TIMEOUT') return jsonResponse({ error: error.message, code: error.code }, 503);
+      return jsonResponse({ error: '用户名或密码错误，或账号尚未开通' }, 401);
+    }
+  }
+
+  if (pathname.endsWith('/api/register') && method === 'POST') {
+    const body = await requestJSON(init);
+    const username = normalizeUsername(body.username);
+    const password = String(body.password || '');
+    const displayName = String(body.displayName || username).trim();
+    if (!/^[a-z0-9_\u4e00-\u9fa5-]{3,24}$/i.test(username)) return jsonResponse({ error: '用户名需为3–24位，可使用中文、字母、数字、下划线或短横线' }, 400);
+    if (password.length < 6) return jsonResponse({ error: '密码至少6个字符' }, 400);
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '云端账号服务尚未配置' }, 503);
+    try {
+      const health = await cloudRequest('/auth/v1/health', { token: CLOUD_CONFIG.anonKey, timeoutMs: 12000 });
+      if (!health.ok) throw Object.assign(new Error(`云端注册服务暂时不可用（HTTP ${health.status}）`), { status: 503, code: 'CLOUD_UNAVAILABLE' });
+      const auth = await cloudJSON('/auth/v1/signup', {
+        method: 'POST',
+        body: {
+          email: await usernameEmail(username),
+          password,
+          data: { username, display_name: displayName || username },
+        },
+        token: CLOUD_CONFIG.anonKey,
+      });
+      if (!auth?.access_token || !auth?.user?.id) {
+        return jsonResponse({ pending: true, message: '注册申请已提交，请等待超级管理员审核授权。' });
+      }
+      const profile = await cloudProfileWithToken(auth.access_token, auth.user.id);
+      if (profile?.status === 'approved') {
+        storeCloudSession(auth, { username: profile.username, displayName: profile.display_name });
+        await cloudJSON('/rest/v1/rpc/record_login', { method: 'POST', body: {}, token: auth.access_token }).catch(() => {});
+        return jsonResponse({
+          token: auth.access_token,
+          user: {
+            id: profile.id,
+            username: profile.username,
+            displayName: profile.display_name || profile.username,
+            role: normalizeUserRole(profile.role),
+            status: profile.status,
+            isCloud: true,
+          },
+          firstAdmin: normalizeUserRole(profile.role) === 'super_admin',
+        });
+      }
+      await cloudRequest('/auth/v1/logout', { method: 'POST', token: auth.access_token }).catch(() => {});
+      clearCloudSession();
+      return jsonResponse({ pending: true, message: '注册申请已提交，请等待超级管理员审核授权。' });
+    } catch (error) {
+      const detail = String(error.message || '');
+      if (/already|registered|duplicate|unique/i.test(detail)) return jsonResponse({ error: '该用户名已被使用，请更换后重试' }, 409);
+      if (isCloudConnectivityError(error)) {
+        return jsonResponse({ error: `${error.message || '云端注册服务暂时不可用'}，请检查网络后重试。`, code: error.code || '' }, 503);
+      }
+      return jsonResponse({ error: `注册失败：${detail}` }, error.status || 400);
+    }
+  }
+
+  if (pathname.endsWith('/api/account/password') && method === 'POST') {
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '密码修改仅在云端模式可用' }, 503);
+    const body = await requestJSON(init);
+    const newPassword = String(body.newPassword || '');
+    if (newPassword.length < 8) return jsonResponse({ error: '新密码至少8个字符' }, 400);
+    const token = await cloudAccessToken();
+    await cloudJSON('/auth/v1/user', {
+      method: 'PUT',
+      body: { password: newPassword },
+      token,
+      timeoutMs: 30000,
+      retries: 3,
+    });
+    return jsonResponse({ ok: true });
+  }
+
+  if (pathname.endsWith('/api/logout') && method === 'POST') {
+    if (CLOUD_ENABLED) await cloudSignOut();
+    return jsonResponse({ ok: true });
+  }
+
+  if (pathname.endsWith('/api/admin/users') && method === 'GET') {
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '用户管理仅在云端模式可用' }, 503);
+    await cloudRequireAdmin(init);
+    const token = await cloudAccessToken();
+    const users = await cloudJSON('/rest/v1/profiles?select=id,username,display_name,status,role,created_at,approved_at,approved_by,last_login_at&order=created_at.desc', { token });
+    return jsonResponse({ users: Array.isArray(users) ? users : [] });
+  }
+
+  if (pathname.endsWith('/api/admin/projects') && method === 'GET') {
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '用户管理仅在云端模式可用' }, 503);
+    await cloudRequireAdmin(init);
+    const token = await cloudAccessToken();
+    const rows = await cloudJSON('/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at&order=updated_at.desc&limit=1000', { token });
+    const projects = [];
+    for (const row of Array.isArray(rows) ? rows : []) projects.push(await cloudProjectSummary(cloudProject(row)));
+    return jsonResponse({ projects });
+  }
+
+  if (pathname.endsWith('/api/admin/audit') && method === 'GET') {
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '用户管理仅在云端模式可用' }, 503);
+    await cloudRequireAdmin(init);
+    const token = await cloudAccessToken();
+    const logs = await cloudJSON('/rest/v1/audit_logs?select=id,actor_id,action,target_user_id,target_project_id,metadata,created_at&order=created_at.desc&limit=30', { token });
+    return jsonResponse({ logs: Array.isArray(logs) ? logs : [] });
+  }
+
+  const adminStatusMatch = pathname.match(/\/api\/admin\/users\/([0-9a-f-]{36})\/status$/i);
+  if (adminStatusMatch && method === 'POST') {
+    if (!CLOUD_ENABLED) return jsonResponse({ error: '用户管理仅在云端模式可用' }, 503);
+    const admin = await cloudRequireAdmin(init);
+    const targetId = adminStatusMatch[1];
+    const body = await requestJSON(init);
+    const nextStatus = String(body.status || '');
+    if (!['approved', 'rejected', 'disabled', 'pending'].includes(nextStatus)) return jsonResponse({ error: '无效的审核状态' }, 400);
+    if (targetId === admin.id && nextStatus !== 'approved') return jsonResponse({ error: '不能停用或拒绝当前超级管理员账号' }, 400);
+    const token = await cloudAccessToken();
+    const rows = await cloudJSON(`/rest/v1/profiles?id=eq.${encodeURIComponent(targetId)}&select=id,username,display_name,status,role`, { token });
+    const target = Array.isArray(rows) ? rows[0] : null;
+    if (!target) return jsonResponse({ error: '目标用户不存在' }, 404);
+    if (normalizeUserRole(target.role) === 'super_admin' && nextStatus !== 'approved') return jsonResponse({ error: '不能停用或拒绝超级管理员账号' }, 400);
+    const patch = {
+      status: nextStatus,
+      approved_at: nextStatus === 'approved' ? new Date().toISOString() : null,
+      approved_by: nextStatus === 'approved' ? admin.id : null,
+    };
+    const updated = await cloudJSON(`/rest/v1/profiles?id=eq.${encodeURIComponent(targetId)}&select=id,username,display_name,status,role,created_at,approved_at,approved_by,last_login_at`, {
+      method: 'PATCH', token, body: patch, headers: { Prefer: 'return=representation' },
+    });
+    await cloudJSON('/rest/v1/audit_logs', {
+      method: 'POST', token, body: {
+        actor_id: admin.id,
+        action: `user_${nextStatus}`,
+        target_user_id: targetId,
+        metadata: { previousStatus: target.status, nextStatus, username: target.username },
+      },
+    }).catch(() => {});
+    return jsonResponse({ ok: true, user: Array.isArray(updated) ? updated[0] : null });
+  }
+
+  const user = await currentUser(init);
+  if (!user && !pathname.endsWith('/api/health')) {
+    const legacyLocalSession = Boolean(usernameFromToken(authTokenFromRequest(init)));
+    return jsonResponse({ error: legacyLocalSession ? '旧版本机会话已停用，请重新登录云端账号；历史项目会在登录后自动并入云端工作台。' : '请先登录' }, 401);
+  }
+
+  if (pathname.endsWith('/api/me') && method === 'GET') return jsonResponse(user);
+
+  if (pathname.endsWith('/api/default-model') && method === 'GET') {
+    return jsonResponse({ model: await defaultModel('分享项目模板') });
+  }
+
+  if (pathname.endsWith('/api/calculate') && method === 'POST') {
+    const body = await requestJSON(init);
+    const result = await calculate(body.model, body.includeSensitivity !== false);
+    return jsonResponse(result);
+  }
+
+  if (pathname.endsWith('/api/export/shop-audit') && method === 'POST') {
+    const body = await requestJSON(init);
+    const model = await normalizeModel(body.model || body);
+    const result = await calculate(model, false);
+    return fileResponse(await workbookBlob(exportShopAuditWorkbook(result)), `${result.summary?.projectName || '项目'}_一铺一价核算表_含公式.xlsx`, XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/export/preopening-budget-detail') && method === 'POST') {
+    const body = await requestJSON(init);
+    const model = await normalizeModel(body.model || body);
+    const result = await calculate(model, false);
+    return fileResponse(await workbookBlob(exportCurrentPreopeningBudget(result)), `${result.summary?.projectName || '项目'}_筹备期成本当前明细.xlsx`, XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/export/operating-budget-detail') && method === 'POST') {
+    const body = await requestJSON(init);
+    const model = await normalizeModel(body.model || body);
+    const result = await calculate(model, false);
+    return fileResponse(await workbookBlob(exportCurrentOperatingBudget(result)), `${result.summary?.projectName || '项目'}_运营成本当前预算.xlsx`, XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/import-shops') && method === 'POST') {
+    const body = await requestJSON(init);
+    if (!body.contentBase64) return jsonResponse({ error: '请选择要导入的文件' }, 400);
+    return jsonResponse(parseShopWorkbook(body.contentBase64, String(body.filename || '')));
+  }
+
+  if (pathname.endsWith('/api/import-operating-budget') && method === 'POST') {
+    const body = await requestJSON(init);
+    if (!body.contentBase64) return jsonResponse({ error: '请选择运营成本预算文件' }, 400);
+    try { return jsonResponse(parseOperatingBudgetWorkbook(body.contentBase64, String(body.filename || ''))); }
+    catch (error) { return jsonResponse({ error: error.message }, 400); }
+  }
+
+  if (pathname.endsWith('/api/import-preopening-budget') && method === 'POST') {
+    const body = await requestJSON(init);
+    if (!body.contentBase64) return jsonResponse({ error: '请选择筹备期成本明细文件' }, 400);
+    try { return jsonResponse(parsePreopeningBudgetWorkbook(body.contentBase64, String(body.filename || ''))); }
+    catch (error) { return jsonResponse({ error: error.message }, 400); }
+  }
+
+  if (pathname.endsWith('/api/import-market-comps') && method === 'POST') {
+    const body = await requestJSON(init);
+    if (!body.contentBase64) return jsonResponse({ error: '请选择竞品租金文件' }, 400);
+    return jsonResponse(parseMarketWorkbook(body.contentBase64, String(body.filename || '')));
+  }
+
+  if (pathname.endsWith('/api/market-analysis') && method === 'POST') {
+    const body = await requestJSON(init);
+    try {
+      return jsonResponse(await marketAnalysis(Number(body.lat), Number(body.lon), Math.max(1, Math.min(10, Number(body.radiusKm || 3)))));
+    } catch (error) {
+      return jsonResponse({ error: `周边市场数据服务暂时不可用：${error.message}。可稍后重试或继续导入竞品租金样本。` }, 502);
+    }
+  }
+
+  if (pathname.endsWith('/api/geocode') && method === 'GET') {
+    try { return jsonResponse(await geocode(url.searchParams.get('q') || '')); }
+    catch (error) { return jsonResponse({ error: error.message }, 503); }
+  }
+
+  if (pathname.endsWith('/api/reverse-geocode') && method === 'GET') {
+    return jsonResponse(await reverseGeocode(Number(url.searchParams.get('lat')), Number(url.searchParams.get('lon'))));
+  }
+
+  if (pathname.endsWith('/api/templates/shop-import') && method === 'GET') {
+    return fileResponse(await workbookBlob(shopTemplate()), '商业地产铺位导入模板.xlsx', XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/templates/market-comps') && method === 'GET') {
+    return fileResponse(await workbookBlob(marketTemplate()), '商业地产竞品租金导入模板.xlsx', XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/templates/operating-budget') && method === 'GET') {
+    return fileResponse(await workbookBlob(operatingBudgetTemplate()), '商业地产运营成本预算导入模板.xlsx', XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/templates/natural-year-adjustments') && method === 'POST') {
+    const body = await requestJSON(init);
+    const model = await normalizeModel(body.model || body);
+    const result = await calculate(model, false);
+    return fileResponse(await workbookBlob(naturalYearAdjustmentWorkbook(result)), '商业地产自然年调整模板.xlsx', XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/export/natural-year') && method === 'POST') {
+    const body = await requestJSON(init);
+    const model = await normalizeModel(body.model || body);
+    const result = await calculate(model, false);
+    const wb = XLSX.utils.book_new();
+    addSheet(wb, '自然年运营报表', naturalYearReportSheetRows(result), [12, 18, 18, 10, 12, 12, 12, 16, 16, 16, 16, 16, 16, 16, 16, 16, 24, 16, 14, 16, 16, 16, 20, 22, 22, 40]);
+    return fileResponse(await workbookBlob(wb), `${result.summary?.projectName || '项目'}_自然年运营报表.xlsx`, XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/import-natural-year-adjustments') && method === 'POST') {
+    const body = await requestJSON(init);
+    if (!body.contentBase64) return jsonResponse({ error: '请选择自然年调整文件' }, 400);
+    try { return jsonResponse(parseNaturalYearAdjustments(body.contentBase64, String(body.filename || ''))); }
+    catch (error) { return jsonResponse({ error: error.message }, 400); }
+  }
+
+  if (pathname.endsWith('/api/templates/preopening-budget') && method === 'GET') {
+    return fileResponse(await workbookBlob(preopeningBudgetTemplate()), '商业地产筹备期成本明细导入模板.xlsx', XLSX_MIME);
+  }
+
+  if (pathname.endsWith('/api/share/users') && method === 'GET') {
+    if (user.isCloud) {
+      try {
+        const token = await cloudAccessToken();
+        const rows = await cloudJSON('/rest/v1/profiles?status=eq.approved&select=id,username,display_name,status&order=display_name.asc', { token });
+        return jsonResponse({ users: (Array.isArray(rows) ? rows : []).filter(item => item.id !== user.id).map(item => ({ id: item.id, username: item.username, displayName: item.display_name || item.username })) });
+      } catch (error) {
+        return jsonResponse({ users: [], warning: '当前云端权限不支持直接读取用户目录，可使用项目分享码发送。' });
+      }
+    }
+    const users = await ensureUsers();
+    return jsonResponse({ users: Object.entries(users).filter(([username, item]) => username !== user.username && username !== 'demo' && (!item.status || item.status === 'approved')).map(([username, item]) => ({ id: username, username, displayName: item.displayName || username })) });
+  }
+
+  const shareMatch = pathname.match(/\/api\/projects\/([0-9a-f-]{8,64})\/share$/i);
+  if (shareMatch && method === 'POST') {
+    const body = await requestJSON(init);
+    const sourceId = shareMatch[1];
+    const recipientUsername = String(body.recipientUsername || '').trim();
+    const recipientId = String(body.recipientId || recipientUsername).trim();
+    const note = String(body.note || '').trim();
+    if (!recipientId || recipientId === user.id || recipientUsername === user.username) return jsonResponse({ error: '请选择其他已审核用户作为接收方' }, 400);
+    let source = null;
+    if (user.isCloud) {
+      const token = await cloudAccessToken();
+      const rows = await cloudJSON(`/rest/v1/projects?id=eq.${encodeURIComponent(sourceId)}&user_id=eq.${encodeURIComponent(user.id)}&select=id,user_id,name,model,created_at,updated_at`, { token });
+      source = Array.isArray(rows) && rows[0] ? cloudProject(rows[0]) : null;
+    } else {
+      source = getProjects(user.username).find(item => item.id === sourceId) || null;
+    }
+    if (!source) return jsonResponse({ error: '项目不存在或无权分享' }, 404);
+    const sourceName = source.model?.project?.name || source.name || '未命名商业项目';
+    const sharedModel = await normalizeModel(JSON.parse(JSON.stringify(source.model || {})));
+    sharedModel.shareMeta = { sourceProjectId: sourceId, sourceUsername: user.username, sourceDisplayName: user.displayName || user.username, sharedAt: new Date().toISOString(), note };
+    sharedModel.project.name = `${sourceName} · ${user.displayName || user.username}分享`;
+    if (user.isCloud) {
+      try {
+        const token = await cloudAccessToken();
+        const rows = await cloudJSON('/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at', {
+          method: 'POST', token,
+        body: { user_id: recipientId, name: sharedModel.project.name, model: sharedModel, updated_at: new Date().toISOString() },
+          headers: { Prefer: 'return=representation' },
+        });
+        if (!Array.isArray(rows) || !rows[0]) throw new Error('直接投递失败');
+        return jsonResponse({ direct: true, project: cloudProject(rows[0]) });
+      } catch (error) {
+        return jsonResponse({ error: '云端项目权限未开放直接投递到对方账户，请使用项目分享码发送。', code: 'SHARE_REQUIRES_CODE' }, 403);
+      }
+    }
+    const targetUsers = await ensureUsers();
+    const target = targetUsers[recipientUsername];
+    if (!target || (target.status && target.status !== 'approved')) return jsonResponse({ error: '接收用户不存在或尚未通过审核' }, 404);
+    const now = isoNow();
+    const sharedProject = { id: crypto.randomUUID(), model: sharedModel, createdAt: now, updatedAt: now };
+    const targetProjects = getProjects(recipientUsername);
+    targetProjects.unshift(sharedProject);
+    saveProjects(recipientUsername, targetProjects);
+    return jsonResponse({ direct: true, project: sharedProject });
+  }
+
+  const duplicateMatch = pathname.match(/\/api\/projects\/([0-9a-f-]{8,64})\/duplicate$/i);
+  if (duplicateMatch && method === 'POST') {
+    const sourceId = duplicateMatch[1];
+    let source = null;
+    if (user.isCloud) {
+      const token = await cloudAccessToken();
+      const rows = await cloudJSON(`/rest/v1/projects?id=eq.${encodeURIComponent(sourceId)}&user_id=eq.${encodeURIComponent(user.id)}&select=id,user_id,name,model,created_at,updated_at`, { token });
+      source = Array.isArray(rows) && rows[0] ? cloudProject(rows[0]) : null;
+    } else {
+      source = getProjects(user.username).find(item => item.id === sourceId) || null;
+    }
+    if (!source) return jsonResponse({ error: '项目不存在或无权复制' }, 404);
+    const duplicateModel = await normalizeModel(JSON.parse(JSON.stringify(source.model || {})));
+    duplicateModel.project.name = `${source.model?.project?.name || source.name || '未命名商业项目'} · 方案副本`;
+    let project;
+    if (user.isCloud) {
+      const token = await cloudAccessToken();
+      const rows = await cloudJSON('/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at', {
+        method: 'POST', token,
+        body: { user_id: user.id, name: duplicateModel.project.name, model: duplicateModel, updated_at: new Date().toISOString() },
+        headers: { Prefer: 'return=representation' },
+      });
+      if (!Array.isArray(rows) || !rows[0]) throw new Error('项目副本创建失败');
+      project = cloudProject(rows[0]);
+    } else {
+      const now = isoNow();
+      project = { id: crypto.randomUUID(), model: duplicateModel, createdAt: now, updatedAt: now };
+      const rows = getProjects(user.username);
+      rows.unshift(project);
+      saveProjects(user.username, rows);
+    }
+    return jsonResponse({ project, result: await calculate(duplicateModel, false) });
+  }
+
+  if (pathname.endsWith('/api/projects') && method === 'GET') {
+    const projects = [];
+    const metaOnly = url.searchParams.get('meta') === '1';
+    let migratedLocalProjects = 0;
+    let localProjectMigrationFailures = 0;
+    if (user.isCloud) {
+      const token = await cloudAccessToken();
+      const rows = await cloudJSON(`/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at&user_id=eq.${encodeURIComponent(user.id)}&order=updated_at.desc&limit=1000`, { token });
+      const migration = await migrateLocalProjectsToCloud(user, token, Array.isArray(rows) ? rows : []);
+      migratedLocalProjects = migration.migrated;
+      localProjectMigrationFailures = migration.failed;
+      for (const row of migration.rows) {
+        const project = { ...cloudProject(row), storage: 'cloud' };
+        projects.push(metaOnly ? project : await cloudProjectSummary(project));
+      }
+    }
+    projects.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    return jsonResponse({ projects, migratedLocalProjects, localProjectMigrationFailures });
+  }
+
+  if (pathname.endsWith('/api/projects') && method === 'POST') {
+    const body = await requestJSON(init);
+    const projectName = String(body.name || body.model?.project?.name || '未命名商业项目').trim();
+    const model = await normalizeModel(body.model || await defaultModel(projectName));
+    if (!user.isCloud) return jsonResponse({ error: '请重新登录云端账号后再创建项目' }, 401);
+    const token = await cloudAccessToken();
+    const rows = await cloudJSON('/rest/v1/projects?select=id,user_id,name,model,created_at,updated_at', {
+      method: 'POST', token,
+      body: { user_id: user.id, name: projectName, model, updated_at: new Date().toISOString() },
+      headers: { Prefer: 'return=representation' },
+    });
+    if (!Array.isArray(rows) || !rows[0]) throw new Error('项目创建失败，请稍后重试');
+    const project = cloudProject(rows[0]);
+    return jsonResponse({ project, result: await calculate(model, false) });
+  }
+
+  const match = pathname.match(/\/api\/projects\/([0-9a-f-]{8,64})(?:\/export\/(xlsx|pptx))?$/i);
+  if (match) {
+    const id = match[1];
+    const format = match[2];
+    let project = null;
+    if (!user.isCloud) return jsonResponse({ error: '请重新登录云端账号后再访问项目' }, 401);
+    const cloudToken = await cloudAccessToken();
+    const rows = await cloudJSON(`/rest/v1/projects?id=eq.${encodeURIComponent(id)}&select=id,user_id,name,model,created_at,updated_at`, { token: cloudToken });
+    if (Array.isArray(rows) && rows[0]) project = cloudProject(rows[0]);
+    if (!project) return jsonResponse({ error: '项目不存在或无权访问' }, 404);
+    if (format === 'xlsx') {
+      const result = await calculate(project.model, true);
+      return fileResponse(await exportExcel(result), `${result.summary.projectName || '项目'}_投资测算.xlsx`, XLSX_MIME);
+    }
+    if (format === 'pptx') {
+      const result = await calculate(project.model, true);
+      return fileResponse(await exportPPT(result), `${result.summary.projectName || '项目'}_投资汇报.pptx`, PPTX_MIME);
+    }
+    if (method === 'GET') return jsonResponse({ project, result: await calculate(project.model, true) });
+    if (method === 'PUT') {
+      const body = await requestJSON(init);
+      const model = await normalizeModel(body.model || body);
+      const clientUpdatedAt = String(body.clientUpdatedAt || '').trim();
+      const expectedMs = Date.parse(clientUpdatedAt);
+      const currentMs = Date.parse(project.updatedAt);
+      const timestampsDiffer = clientUpdatedAt && project.updatedAt && (
+        Number.isFinite(expectedMs) && Number.isFinite(currentMs)
+          ? expectedMs !== currentMs
+          : clientUpdatedAt !== String(project.updatedAt)
+      );
+      if (!body.forceOverwrite && timestampsDiffer) {
+        return jsonResponse({
+          error: '检测到其他设备已保存此项目。为避免覆盖最新数据，请先加载云端版本或明确选择覆盖。',
+          code: 'PROJECT_CONFLICT',
+          project,
+          result: await calculate(project.model, true),
+        }, 409);
+      }
+      const updatedRows = await cloudJSON(`/rest/v1/projects?id=eq.${encodeURIComponent(id)}&select=id,user_id,name,model,created_at,updated_at`, {
+        method: 'PATCH', token: cloudToken,
+        body: {
+          model,
+          name: String(body.name || model.project?.name || project.name || '未命名商业项目').trim(),
+          updated_at: new Date().toISOString(),
+        },
+        headers: { Prefer: 'return=representation' },
+      });
+      if (!Array.isArray(updatedRows) || !updatedRows[0]) return jsonResponse({ error: '项目保存失败或无权修改' }, 403);
+      project = cloudProject(updatedRows[0]);
+      return jsonResponse({ project, result: await calculate(model, true) });
+    }
+    if (method === 'DELETE') {
+      await cloudRequest(`/rest/v1/projects?id=eq.${encodeURIComponent(id)}`, {
+        method: 'DELETE', token: cloudToken, headers: { Prefer: 'return=minimal' },
+      }).then(async response => {
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(cloudErrorMessage(payload, '项目删除失败'));
+        }
+      });
+      return jsonResponse({ ok: true });
+    }
+  }
+
+  if (pathname.endsWith('/api/health')) return jsonResponse({ ok: true, mode: CLOUD_ENABLED ? 'supabase-cloud' : 'browser-local', time: new Date().toISOString() });
+  return jsonResponse({ error: '接口不存在' }, 404);
+}
+
+window.fetch = async function duoduoFetch(input, init = {}) {
+  const rawUrl = typeof input === 'string' ? input : input?.url || '';
+  const url = new URL(rawUrl, location.href);
+  if (!url.pathname.includes('/api/')) return nativeFetch(input, init);
+  try {
+    const fastEndpoints = [
+      '/api/login', '/api/register', '/api/logout', '/api/me', '/api/health',
+      '/api/geocode', '/api/reverse-geocode', '/api/market-analysis',
+      '/api/admin/users', '/api/admin/audit', '/api/share/users',
+    ];
+    const method = String(init?.method || 'GET').toUpperCase();
+    const projectMetaRequest = method === 'GET' && url.pathname.endsWith('/api/projects') && url.searchParams.get('meta') === '1';
+    const fastRequest = projectMetaRequest || fastEndpoints.some(path => url.pathname.endsWith(path)) || /\/api\/admin\/users\/[0-9a-f-]+\/status$/i.test(url.pathname);
+    const needsXlsx = /\/api\/templates\//.test(url.pathname) || /\/api\/import-(shops|operating-budget|preopening-budget|market-comps|natural-year-adjustments)$/.test(url.pathname) || /\/export\/(xlsx|natural-year|shop-audit|preopening-budget-detail|operating-budget-detail)$/.test(url.pathname);
+    const needsPptx = /\/export\/pptx$/.test(url.pathname);
+    if (needsXlsx) await ensureXlsxLibrary();
+    if (needsPptx) await ensurePptxLibrary();
+    if (!fastRequest) await loadPyodideEngine();
+    return await handleApi(rawUrl, init);
+  } catch (error) {
+    const status = Number(error?.status) || 500;
+    if (![401, 403, 404].includes(status)) console.error(error);
+    return jsonResponse({
+      error: String(error?.message || error || '处理失败'),
+      code: error?.code || '',
+      status: error?.accountStatus || '',
+    }, status);
+  }
+};
+
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register(new URL('./sw.js', import.meta.url), { scope: './' }).catch(error => {
+    console.warn('离线缓存未启用', error);
+  });
+}
